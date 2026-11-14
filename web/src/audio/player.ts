@@ -1,7 +1,7 @@
 // Audio player supporting:
 // 1. Static media files (/media/audio/...) when real audio (>512B) exists
-// 2. Router-cached neural/dictionary TTS stream (/api/v1/tts?text=...) so Linux/iOS/Android devices without local TTS voices always have clear Chinese pronunciation
-// 3. Browser Web Speech API (window.speechSynthesis) offline fallback with cancel-race protection
+// 2. Router-cached neural/dictionary TTS stream (/api/v1/tts?text=...) with 900ms fast-timeout + background prefetch
+// 3. Browser Web Speech API (window.speechSynthesis) instant fallback
 
 export interface PlayResult {
   durationMs: number;
@@ -10,6 +10,7 @@ export interface PlayResult {
 
 class ReaderAudioPlayer {
   private currentAudio: HTMLAudioElement | null = null;
+  private prefetched = new Set<string>();
 
   stop(): void {
     if (this.currentAudio) {
@@ -22,16 +23,52 @@ class ReaderAudioPlayer {
     }
   }
 
-  private tryPlayAudioUrl(url: string, startTime: number): Promise<PlayResult> {
+  /**
+   * Silently pre-warms server-side & browser-side cache for the current sentence and its characters
+   * right when the user flips to a page, so tapping any character plays instantaneously.
+   */
+  prefetchTexts(texts: string[]): void {
+    const unique = Array.from(new Set(texts.map((t) => t.trim()).filter(Boolean)));
+    const pending = unique.filter((t) => !this.prefetched.has(t));
+    if (pending.length === 0) return;
+
+    // Limit background concurrency so we never saturate the router
+    const queue = [...pending];
+    const worker = async () => {
+      while (queue.length > 0) {
+        const text = queue.shift();
+        if (!text || this.prefetched.has(text)) continue;
+        this.prefetched.add(text);
+        try {
+          await fetch(`/api/v1/tts?text=${encodeURIComponent(text)}`);
+        } catch {
+          // Ignore prefetch errors
+        }
+      }
+    };
+    void Promise.all([worker(), worker()]);
+  }
+
+  private tryPlayAudioUrl(url: string, startTime: number, loadTimeoutMs = 900): Promise<PlayResult> {
     return new Promise<PlayResult>((resolve, reject) => {
       const audio = new Audio(url);
       this.currentAudio = audio;
       let settled = false;
+      let startedPlaying = false;
+
+      const loadTimer = setTimeout(() => {
+        if (!settled && !startedPlaying) {
+          settled = true;
+          audio.pause();
+          audio.src = '';
+          reject(new Error('audio load timeout'));
+        }
+      }, loadTimeoutMs);
 
       const finishOk = () => {
         if (settled) return;
+        clearTimeout(loadTimer);
         const elapsed = Math.round(performance.now() - startTime);
-        // Guard against silent/empty placeholder audio files (<120ms duration)
         if ((audio.duration && audio.duration < 0.12) || elapsed < 80) {
           settled = true;
           reject(new Error('silent or empty audio'));
@@ -43,10 +80,15 @@ class ReaderAudioPlayer {
 
       const finishErr = (err: unknown) => {
         if (settled) return;
+        clearTimeout(loadTimer);
         settled = true;
         reject(err instanceof Error ? err : new Error('audio playback failed'));
       };
 
+      audio.onplaying = () => {
+        startedPlaying = true;
+        clearTimeout(loadTimer);
+      };
       audio.onended = finishOk;
       audio.onerror = () => finishErr(new Error('media load failed'));
       audio.play().catch(finishErr);
@@ -102,26 +144,25 @@ class ReaderAudioPlayer {
     const startTime = performance.now();
     const cleanText = (fallbackText || '').trim();
 
-    // 1. Try explicit static audio URL if present
     if (audioUrl && audioUrl.trim() !== '') {
       try {
-        return await this.tryPlayAudioUrl(audioUrl, startTime);
+        return await this.tryPlayAudioUrl(audioUrl, startTime, 1500);
       } catch {
-        // Fall through to backend cached TTS & Web Speech
+        // Fall through
       }
     }
 
-    // 2. Try backend cached TTS endpoint (/api/v1/tts?text=...) which caches real MP3 audio on /mnt/sda1/reader/media/audio/
     if (cleanText) {
       try {
         const ttsUrl = `/api/v1/tts?text=${encodeURIComponent(cleanText)}`;
-        return await this.tryPlayAudioUrl(ttsUrl, startTime);
+        // 900ms fast timeout: if not cached/ready quickly, fall back to instant local Web Speech immediately
+        return await this.tryPlayAudioUrl(ttsUrl, startTime, 900);
       } catch {
-        // Offline or upstream unavailable -> fall through to local Web Speech synthesis
+        // Trigger background cache warm-up for next click while immediately speaking locally
+        void fetch(`/api/v1/tts?text=${encodeURIComponent(cleanText)}`).catch(() => {});
       }
     }
 
-    // 3. Offline browser Web Speech synthesis fallback
     return this.speakWithWebSpeech(cleanText, startTime);
   }
 }

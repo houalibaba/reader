@@ -41,7 +41,7 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, dbConn *sql.DB, webFS fs.FS) *Server {
-	return &Server{
+	srv := &Server{
 		cfg:      cfg,
 		db:       dbConn,
 		events:   events.NewService(dbConn),
@@ -51,6 +51,8 @@ func NewServer(cfg *config.Config, dbConn *sql.DB, webFS fs.FS) *Server {
 		webFS:    webFS,
 		updater:  updater.New(cfg),
 	}
+	go srv.precacheAllPublishedStories()
+	return srv
 }
 
 func (s *Server) Routes() http.Handler {
@@ -569,62 +571,62 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	}
 
 	var prompt strings.Builder
-prompt.WriteString("请为正在学习中文阅读的儿童编写一篇【10分钟阅读量（约 360~450 字，共 4 个章节、16~20 句话）】的趣味分级绘本故事。\n\n")
-prompt.WriteString("【一、十分钟阅读科学字数与最近发展区（ZPD）配比】\n")
-prompt.WriteString("- 目标阅读时长：10 分钟（按小学一年级儿童点读与理解速度 36~45 字/分钟测算）。\n")
-prompt.WriteString("- 篇幅与句长：共 4 个章节、16~20 句话（每页 1 句话，每句 18~24 个汉字，总字数 360~450 字）。\n")
-prompt.WriteString("- 科学识字配比（90%~92% 已掌握熟字 + 8%~10% 目标生字）：\n")
-prompt.WriteString(fmt.Sprintf("  1) 已掌握字词基座（占全篇总字数的 90%%~92%%，约 330~410 字次）：完整复用下方列出的全部已掌握字词（共 %d 个历史已掌握字音 + 基础高频熟字基座）。\n", len(familiarAnchors)))
-prompt.WriteString(fmt.Sprintf("  2) 科学比例生字池（占全篇总字数的 8%%~10%%，约 30~40 字次）：由系统根据【艾宾浩斯遗忘曲线】算出的 %d 个待复习生字 + %d 个全新拓展生字组成，每个生字在文中不同章节自然复现 2~3 次。\n\n", forgettingCount, len(newCandidates)))
+	prompt.WriteString("请为正在学习中文阅读的儿童编写一篇【10分钟阅读量（约 360~450 字，共 4 个章节、16~20 句话）】的趣味分级绘本故事。\n\n")
+	prompt.WriteString("【一、十分钟阅读科学字数与最近发展区（ZPD）配比】\n")
+	prompt.WriteString("- 目标阅读时长：10 分钟（按小学一年级儿童点读与理解速度 36~45 字/分钟测算）。\n")
+	prompt.WriteString("- 篇幅与句长：共 4 个章节、16~20 句话（每页 1 句话，每句 18~24 个汉字，总字数 360~450 字）。\n")
+	prompt.WriteString("- 科学识字配比（90%~92% 已掌握熟字 + 8%~10% 目标生字）：\n")
+	prompt.WriteString(fmt.Sprintf("  1) 已掌握字词基座（占全篇总字数的 90%%~92%%，约 330~410 字次）：完整复用下方列出的全部已掌握字词（共 %d 个历史已掌握字音 + 基础高频熟字基座）。\n", len(familiarAnchors)))
+	prompt.WriteString(fmt.Sprintf("  2) 科学比例生字池（占全篇总字数的 8%%~10%%，约 30~40 字次）：由系统根据【艾宾浩斯遗忘曲线】算出的 %d 个待复习生字 + %d 个全新拓展生字组成，每个生字在文中不同章节自然复现 2~3 次。\n\n", forgettingCount, len(newCandidates)))
 
-prompt.WriteString("【二、孩子已掌握的全部字词库（占全篇 90%~92%，请全面复用作为故事主干，切勿超纲使用未学过的生僻字）】\n")
-if len(familiarAnchors) > 0 {
-var famParts []string
-for _, t := range familiarAnchors {
-famParts = append(famParts, fmt.Sprintf("%s(%s：%s)", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/")))
-}
-prompt.WriteString(fmt.Sprintf("- 历史已掌握的全部字词（共 %d 项，完整列出）：%s\n", len(familiarAnchors), strings.Join(famParts, "、")))
-} else {
-prompt.WriteString("- 历史已掌握字词：当前为初始建档阶段，尚无完整历史熟字记录，请直接使用下方基础高频熟字基座。\n")
-}
-prompt.WriteString(fmt.Sprintf("- 基础高频熟字与语法脚手架：%s\n\n", foundationalScaffoldWords))
+	prompt.WriteString("【二、孩子已掌握的全部字词库（占全篇 90%~92%，请全面复用作为故事主干，切勿超纲使用未学过的生僻字）】\n")
+	if len(familiarAnchors) > 0 {
+		var famParts []string
+		for _, t := range familiarAnchors {
+			famParts = append(famParts, fmt.Sprintf("%s(%s：%s)", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/")))
+		}
+		prompt.WriteString(fmt.Sprintf("- 历史已掌握的全部字词（共 %d 项，完整列出）：%s\n", len(familiarAnchors), strings.Join(famParts, "、")))
+	} else {
+		prompt.WriteString("- 历史已掌握字词：当前为初始建档阶段，尚无完整历史熟字记录，请直接使用下方基础高频熟字基座。\n")
+	}
+	prompt.WriteString(fmt.Sprintf("- 基础高频熟字与语法脚手架：%s\n\n", foundationalScaffoldWords))
 
-prompt.WriteString("【三、十分钟阅读科学比例生字池（占全篇 8%~10%：艾宾浩斯遗忘曲线复习字 + 新拓展生字）】\n")
-if len(reviewTargets) > 0 {
-var parts []string
-for _, t := range reviewTargets {
-parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
-}
-prompt.WriteString("1. 遗忘曲线急需复习生字（高频求助/接近遗忘临界点）：" + strings.Join(parts, "、") + "\n")
-}
-if len(observeTargets) > 0 {
-var parts []string
-for _, t := range observeTargets {
-parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
-}
-prompt.WriteString("2. 遗忘曲线待巩固生字（短期记忆巩固节点）：" + strings.Join(parts, "、") + "\n")
-}
-if len(reviewTargets) == 0 && len(observeTargets) == 0 {
-prompt.WriteString("1. 遗忘曲线待复习生字：当前无处于遗忘临界点的历史生字。\n")
-}
-if len(newCandidates) > 0 {
-var parts []string
-for _, t := range newCandidates {
-wSample := t.RecommendedWords
-if len(wSample) > 2 {
-wSample = wSample[:2]
-}
-parts = append(parts, fmt.Sprintf("「%s(%s，推荐词组：%s)」（要求跨章节自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(wSample, "/"), t.TargetRepetitions))
-}
-prompt.WriteString(fmt.Sprintf("3. 按科学比例新引入的拓展生字（共 %d 个，占全篇约 4%%~5%% 字次）：%s\n", len(newCandidates), strings.Join(parts, "、")))
-}
+	prompt.WriteString("【三、十分钟阅读科学比例生字池（占全篇 8%~10%：艾宾浩斯遗忘曲线复习字 + 新拓展生字）】\n")
+	if len(reviewTargets) > 0 {
+		var parts []string
+		for _, t := range reviewTargets {
+			parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
+		}
+		prompt.WriteString("1. 遗忘曲线急需复习生字（高频求助/接近遗忘临界点）：" + strings.Join(parts, "、") + "\n")
+	}
+	if len(observeTargets) > 0 {
+		var parts []string
+		for _, t := range observeTargets {
+			parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
+		}
+		prompt.WriteString("2. 遗忘曲线待巩固生字（短期记忆巩固节点）：" + strings.Join(parts, "、") + "\n")
+	}
+	if len(reviewTargets) == 0 && len(observeTargets) == 0 {
+		prompt.WriteString("1. 遗忘曲线待复习生字：当前无处于遗忘临界点的历史生字。\n")
+	}
+	if len(newCandidates) > 0 {
+		var parts []string
+		for _, t := range newCandidates {
+			wSample := t.RecommendedWords
+			if len(wSample) > 2 {
+				wSample = wSample[:2]
+			}
+			parts = append(parts, fmt.Sprintf("「%s(%s，推荐词组：%s)」（要求跨章节自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(wSample, "/"), t.TargetRepetitions))
+		}
+		prompt.WriteString(fmt.Sprintf("3. 按科学比例新引入的拓展生字（共 %d 个，占全篇约 4%%~5%% 字次）：%s\n", len(newCandidates), strings.Join(parts, "、")))
+	}
 
-prompt.WriteString("\n【四、排版与多音字语境强约束】\n")
-prompt.WriteString("- 请直接输出故事正文，每行严格对应 1 句话（共 16~20 行，或精简模式至少 5~8 行），不要输出多余解释。\n")
-prompt.WriteString("- 多音字必须严格匹配上述指定读音的语境词组（例如要求复习 háng 时使用“一行/银行”，要求复习 xíng 时使用“行走/通行”）。\n")
-prompt.WriteString("- 遗忘曲线复习字与新拓展生字应分布在故事的起承转合不同段落中（首次出现有上下文线索、中段复现、结尾巩固），严禁生硬堆砌。")
+	prompt.WriteString("\n【四、排版与多音字语境强约束】\n")
+	prompt.WriteString("- 请直接输出故事正文，每行严格对应 1 句话（共 16~20 行，或精简模式至少 5~8 行），不要输出多余解释。\n")
+	prompt.WriteString("- 多音字必须严格匹配上述指定读音的语境词组（例如要求复习 háng 时使用“一行/银行”，要求复习 xíng 时使用“行走/通行”）。\n")
+	prompt.WriteString("- 遗忘曲线复习字与新拓展生字应分布在故事的起承转合不同段落中（首次出现有上下文线索、中段复现、结尾巩固），严禁生硬堆砌。")
 
-return &childStoryPlanResult{
+	return &childStoryPlanResult{
 		ChildID: childID,
 		Summary: map[string]any{
 			"total_tracked_char_pinyins":  totalTracked,
@@ -822,6 +824,7 @@ func (s *Server) handleAdminQuickStory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	go s.precacheStoryVersionAudio(manifest.VersionID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"imported_story_id":   manifest.StoryID,
@@ -956,6 +959,7 @@ func (s *Server) handleAdminAutoGenerateStory(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		go s.precacheStoryVersionAudio(manifest.VersionID)
 		resp["published"] = true
 		resp["imported_story_id"] = storyID
 		resp["imported_version_id"] = versionID
@@ -1315,6 +1319,7 @@ func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		go s.precacheStoryVersionAudio(m.VersionID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"imported_story_id":   m.StoryID,
 			"imported_version_id": m.VersionID,
@@ -1354,6 +1359,7 @@ func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	go s.precacheStoryVersionAudio(manifest.VersionID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"imported_story_id":   manifest.StoryID,
@@ -1542,15 +1548,10 @@ func (s *Server) isRealMediaAudio(audioURL string) bool {
 	return true
 }
 
-func (s *Server) handleTTS(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	text := strings.TrimSpace(r.URL.Query().Get("text"))
+func (s *Server) ensureTTSAudioCached(ctx context.Context, text string) (string, string, error) {
+	text = strings.TrimSpace(text)
 	if text == "" || len([]rune(text)) > 200 {
-		writeError(w, http.StatusBadRequest, "valid text required")
-		return
+		return "", "", errors.New("invalid text")
 	}
 
 	sum := sha256.Sum256([]byte(text))
@@ -1558,11 +1559,10 @@ func (s *Server) handleTTS(w http.ResponseWriter, r *http.Request) {
 	audioDir := filepath.Join(s.cfg.MediaDir(), "audio")
 	_ = os.MkdirAll(audioDir, 0o755)
 	cachePath := filepath.Join(audioDir, cacheName)
+	mediaURL := "/media/audio/" + cacheName
 
 	if st, err := os.Stat(cachePath); err == nil && st.Size() > 512 {
-		w.Header().Set("Content-Type", "audio/mpeg")
-		http.ServeFile(w, r, cachePath)
-		return
+		return mediaURL, cachePath, nil
 	}
 
 	escaped := url.QueryEscape(text)
@@ -1571,27 +1571,153 @@ func (s *Server) handleTTS(w http.ResponseWriter, r *http.Request) {
 		"https://fanyi.baidu.com/gettts?lan=zh&spd=4&source=web&text=" + escaped,
 	}
 
-	client := &http.Client{Timeout: 8 * time.Second}
+	reqCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+	client := &http.Client{Timeout: 2500 * time.Millisecond}
+	ch := make(chan []byte, len(candidates))
+
 	for _, u := range candidates {
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; x86_64) AppleWebKit/537.36")
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-		_ = resp.Body.Close()
-		if readErr == nil && resp.StatusCode == http.StatusOK && len(data) > 512 {
+		go func(targetURL string) {
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
+			if err != nil {
+				ch <- nil
+				return
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; x86_64) AppleWebKit/537.36")
+			resp, err := client.Do(req)
+			if err != nil {
+				ch <- nil
+				return
+			}
+			data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+			_ = resp.Body.Close()
+			if readErr == nil && resp.StatusCode == http.StatusOK && len(data) > 512 {
+				ch <- data
+				return
+			}
+			ch <- nil
+		}(u)
+	}
+
+	for i := 0; i < len(candidates); i++ {
+		data := <-ch
+		if len(data) > 512 {
+			cancel()
 			_ = os.WriteFile(cachePath, data, 0o644)
-			w.Header().Set("Content-Type", "audio/mpeg")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
-			return
+			return mediaURL, cachePath, nil
+		}
+	}
+	return "", "", errors.New("tts upstream unavailable")
+}
+
+// precacheStoryVersionAudio downloads and caches MP3 pronunciation files on the external disk
+// for every sentence and unique character in the given story version, and writes their local
+// /media/audio/tts_<hash>.mp3 URLs directly into SQLite so reading requires zero network wait.
+func (s *Server) precacheStoryVersionAudio(versionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	sentRows, err := s.db.QueryContext(ctx, `
+		SELECT id, text, COALESCE(audio_url, '')
+		FROM story_sentences
+		WHERE version_id = ?
+		ORDER BY sequence_index ASC
+	`, versionID)
+	if err != nil {
+		return
+	}
+	type sentItem struct {
+		id, text, audioURL string
+	}
+	var sents []sentItem
+	for sentRows.Next() {
+		var it sentItem
+		if err := sentRows.Scan(&it.id, &it.text, &it.audioURL); err == nil {
+			sents = append(sents, it)
+		}
+	}
+	_ = sentRows.Close()
+
+	for _, st := range sents {
+		if !s.isRealMediaAudio(st.audioURL) {
+			if mediaURL, _, err := s.ensureTTSAudioCached(ctx, st.text); err == nil {
+				_, _ = s.db.ExecContext(ctx, "UPDATE story_sentences SET audio_url = ? WHERE id = ?", mediaURL, st.id)
+			}
 		}
 	}
 
-	writeError(w, http.StatusBadGateway, "tts upstream unavailable")
+	charRows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT st.character
+		FROM sentence_tokens st
+		JOIN story_sentences ss ON st.sentence_id = ss.id
+		WHERE ss.version_id = ?
+	`, versionID)
+	if err != nil {
+		return
+	}
+	var chars []string
+	for charRows.Next() {
+		var ch string
+		if err := charRows.Scan(&ch); err == nil && !isPunctuationChar(ch) {
+			chars = append(chars, ch)
+		}
+	}
+	_ = charRows.Close()
+
+	for _, ch := range chars {
+		if mediaURL, _, err := s.ensureTTSAudioCached(ctx, ch); err == nil {
+			_, _ = s.db.ExecContext(ctx, `
+				UPDATE sentence_tokens
+				SET audio_url = ?
+				WHERE character = ? AND sentence_id IN (SELECT id FROM story_sentences WHERE version_id = ?)
+			`, mediaURL, ch, versionID)
+		}
+	}
+}
+
+func (s *Server) precacheAllPublishedStories() {
+	time.Sleep(2 * time.Second)
+	rows, err := s.db.Query(`
+		SELECT sv.id
+		FROM story_versions sv
+		JOIN stories s ON sv.story_id = s.id
+		WHERE s.status = 'published' AND sv.status = 'published'
+		ORDER BY sv.created_at DESC
+	`)
+	if err != nil {
+		return
+	}
+	var vids []string
+	for rows.Next() {
+		var vid string
+		if err := rows.Scan(&vid); err == nil {
+			vids = append(vids, vid)
+		}
+	}
+	_ = rows.Close()
+
+	for _, vid := range vids {
+		s.precacheStoryVersionAudio(vid)
+	}
+}
+
+func (s *Server) handleTTS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method notAllowed")
+		return
+	}
+	text := strings.TrimSpace(r.URL.Query().Get("text"))
+	if text == "" || len([]rune(text)) > 200 {
+		writeError(w, http.StatusBadRequest, "valid text required")
+		return
+	}
+
+	_, cachePath, err := s.ensureTTSAudioCached(r.Context(), text)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	http.ServeFile(w, r, cachePath)
 }

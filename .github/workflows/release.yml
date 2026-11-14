@@ -96,7 +96,7 @@ jobs:
             -o ../dist/reader-linux-arm64 ./cmd/reader
           cd ..
           file dist/reader-linux-amd64 dist/reader-linux-arm64
-          ./dist/reader-linux-arm64 -version 2>/dev/null || ./dist/reader-linux-amd64 -version
+          ./dist/reader-linux-amd64 -version
 
       - name: Generate SHA256 checksums
         run: |

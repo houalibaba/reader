@@ -21,7 +21,7 @@ import (
 )
 
 // CurrentVersion is overridden at build time via -ldflags "-X reader/server/internal/updater.CurrentVersion=vX.Y.Z".
-var CurrentVersion = "v0.3.4"
+var CurrentVersion = "v0.3.6"
 
 type CheckResult struct {
 	CurrentVersion string `json:"current_version"`

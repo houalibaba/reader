@@ -82,6 +82,14 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     setActiveWordIndex(null);
     setActiveToken(null);
 
+    if (currentSentence) {
+      const punct = new Set(['，', '。', '！', '？', '、', '：', '；', '“', '”', '‘', '’', '（', '）']);
+      const chars = currentSentence.tokens
+        .map((t) => t.character)
+        .filter((ch) => !punct.has(ch));
+      audioPlayer.prefetchTexts([currentSentence.text, ...chars]);
+    }
+
     const handleVisibilityChange = () => {
       const nowIso = new Date().toISOString();
       if (document.visibilityState === 'hidden') {
