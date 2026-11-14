@@ -1517,7 +1517,7 @@ func (s *Server) handleAdminUpdateApply(w http.ResponseWriter, r *http.Request) 
 		f.Flush()
 	}
 	if res.Status == "restarting" {
-		s.updater.SpawnRestartAndRollbackWatchdog()
+		s.updater.SpawnRestartAndRollbackWatchdog(res.ExePath, res.NewVersion)
 	}
 }
 

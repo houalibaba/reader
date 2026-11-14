@@ -23,7 +23,7 @@
    - **10分钟科学阅读量 + 艾宾浩斯遗忘曲线提示词重构**：100% 完整列出孩子已掌握的全部字词（90%~92% 主干），结合艾宾浩斯遗忘曲线公式 $R(t) = e^{-\Delta t / S}$ 筛选复习生字并动态配比新生字（8%~10%）。
 5. **v0.3.3（修复部分故事无发音 & 拼音显示为小号汉字 Bug）**：
    - **根因 1（部分故事无声音）**：离线 `.zip` 故事包此前写入了 266 字节的空白 `ID3` 占位 `.mp3`，导致浏览器播放了 0 秒静音且不触发语音合成回退；同时部分 Linux/移动端浏览器缺失本地中文 `speechSynthesis` 语音库。
-     - **修复**：后端自动过滤 `<= 512B` 的空白占位音频并清理内置 `.zip` 故事包；新增 `GET /api/v1/tts?text=...` 服务端中文语音合成与外置盘缓存接口（缓存至 `/mnt/sda1/reader/media/audio/tts_<hash>.mp3`），前端 `player.ts` 实现“真实录音 -> 服务端缓存语音流 -> 本地 Web Speech 防冲突降级”三级保障。
+     - **修复**：后端自动过滤 `<= 512B` 的空白占位音频并清理内置 `.zip` 故事包；新增 `GET /api/v1/tts?text=...` 服务端中文语音合成与外置盘缓存接口（缓存至 `/mnt/usb2-1/reader/media/audio/tts_<hash>.mp3`），前端 `player.ts` 实现“真实录音 -> 服务端缓存语音流 -> 本地 Web Speech 防冲突降级”三级保障。
    - **根因 2（拼音标注变成小号汉字）**：原先 `content.go` / `story_packager.py` 的内置单字字典仅有 39 个汉字，未命中的字回退为汉字本身（`py = ch`），导致汉字上方渲染了更小的同一个汉字。
      - **修复**：新增 `server/internal/content/pinyin_dict.go`（内置 3,600+ 常用汉字与 180+ 多音字词组）并在 GitHub Actions 构建时通过 `pypinyin` 自动注入全部 **20,902 个 Unicode 汉字**；同时后端在读取旧故事时**自动检测并原地修复数据库中未注音的旧记录**，无需重新建故事即可恢复正确拼音。
 
@@ -66,19 +66,17 @@ cd server && go mod tidy && go test -v ./... && cd ..
 # 2. 构建前端 SPA（输出至 server/internal/web/dist/ 供 Go embed）
 make web
 
-# 3. 交叉编译注入版本号的静态二进制（iStoreOS x86_64 用 amd64；ARM64 用 arm64）
-cd server && CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -ldflags="-s -w -extldflags '-static' -X reader/server/internal/updater.CurrentVersion=v0.3.3" \
-  -o ../dist/reader-linux-amd64 ./cmd/reader && cd ..
+# 3. 交叉编译注入版本号的静态二进制（锁定 GOAMD64=v1 并禁用 AVX/BMI2，严格兼容 Intel Atom x5-Z8350 Cherry Trail）
+VERSION=v0.3.8 make build-amd64
 ```
 
 ### Step 3：部署更新到 iStoreOS（保留现有数据与配置）
 ```bash
-scp dist/reader-linux-amd64 root@192.168.100.1:/mnt/sda1/reader/reader.new
+scp dist/reader-linux-amd64 root@192.168.100.1:/mnt/usb2-1/reader/reader.new
 ssh root@192.168.100.1 "
-  chmod +x /mnt/sda1/reader/reader.new &&
+  chmod +x /mnt/usb2-1/reader/reader.new &&
   /etc/init.d/reader stop &&
-  mv /mnt/sda1/reader/reader.new /mnt/sda1/reader/reader &&
+  mv /mnt/usb2-1/reader/reader.new /mnt/usb2-1/reader/reader &&
   /etc/init.d/reader start
 "
 ```
@@ -88,4 +86,4 @@ ssh root@192.168.100.1 "
 ## 三、部署后验收检查清单（Verification Gates）
 
 1. 打开任意已有故事或新建故事，勾选“显示全句拼音提示”或点字，确认所有汉字均显示正确的带声调拼音（旧故事也会在打开时自动修复数据库拼音）。
-2. 点击任意故事的单字与“🔊 整句朗读”，确认均有清晰中文发音（并自动缓存在 `/mnt/sda1/reader/media/audio/` 下）。
+2. 点击任意故事的单字与“🔊 整句朗读”，确认均有清晰中文发音（并自动缓存在 `/mnt/usb2-1/reader/media/audio/` 下）。

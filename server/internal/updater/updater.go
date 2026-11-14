@@ -21,7 +21,7 @@ import (
 )
 
 // CurrentVersion is overridden at build time via -ldflags "-X reader/server/internal/updater.CurrentVersion=vX.Y.Z".
-var CurrentVersion = "v0.3.6"
+var CurrentVersion = "v0.3.8"
 
 type CheckResult struct {
 	CurrentVersion string `json:"current_version"`
@@ -40,6 +40,7 @@ type CheckResult struct {
 
 type ApplyResult struct {
 	Status          string `json:"status"`
+	ExePath         string `json:"-"`
 	PreviousVersion string `json:"previous_version"`
 	NewVersion      string `json:"new_version"`
 	Message         string `json:"message"`
@@ -294,6 +295,7 @@ func (u *Updater) ApplyUpdate(ctx context.Context, mirrorOverride string) (*Appl
 
 	return &ApplyResult{
 		Status:          "restarting",
+		ExePath:         exePath,
 		PreviousVersion: CurrentVersion,
 		NewVersion:      check.LatestVersion,
 		Message:         fmt.Sprintf("已通过完整性与启动自检并切换至 %s，守护进程正在重启服务（若启动异常将自动回滚）...", check.LatestVersion),
@@ -343,18 +345,21 @@ func (u *Updater) runPreFlightSelfTest(ctx context.Context, binPath string) erro
 }
 
 // SpawnRestartAndRollbackWatchdog launches an independent background shell that:
-// 1. Waits briefly for the HTTP response to flush;
-// 2. Restarts the service via /etc/init.d/reader restart (or spawns the binary directly);
-// 3. Verifies that the new binary stays alive and responds on /api/v1/health;
+// 1. Explicitly terminates the current (old) PID so port 8380 is guaranteed to be released;
+// 2. Starts the new binary via /etc/init.d/reader restart AND direct fallback if procd does not launch it;
+// 3. Verifies that /api/v1/health responds with the NEW version string;
 // 4. Automatically rolls back to reader.bak and restarts if the new binary crashes or fails health check!
-func (u *Updater) SpawnRestartAndRollbackWatchdog() {
-	exePath, err := os.Executable()
-	if err != nil {
-		return
+func (u *Updater) SpawnRestartAndRollbackWatchdog(exePath, expectedVersion string) {
+	if exePath == "" {
+		if p, err := os.Executable(); err == nil {
+			exePath = p
+			if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
+				exePath = resolved
+			}
+		}
 	}
-	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
-		exePath = resolved
-	}
+	exePath = strings.TrimSuffix(exePath, ".bak")
+
 	cfgPath := "/mnt/sda1/reader/config.json"
 	tmpDir := "/tmp"
 	port := "8380"
@@ -373,36 +378,59 @@ func (u *Updater) SpawnRestartAndRollbackWatchdog() {
 	}
 
 	logFile := filepath.Join(tmpDir, "updater_watchdog.log")
+	oldPID := os.Getpid()
 	script := fmt.Sprintf(`
 sleep 1
+echo "[watchdog] stopping old pid %d and restarting %s (target %s)" >> %q
+kill -TERM %d 2>/dev/null || true
+sleep 1
+kill -KILL %d 2>/dev/null || true
+
 if [ -x /etc/init.d/reader ]; then
     /etc/init.d/reader restart >> %q 2>&1 || /etc/init.d/reader start >> %q 2>&1
-else
-    kill %d 2>/dev/null || true
-    sleep 1
+fi
+
+sleep 2
+if ! (wget -qO- "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q || curl -fsS "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q); then
+    echo "[watchdog] procd did not bring up new version yet, launching %s directly" >> %q
     TMPDIR=%q GOMEMLIMIT=120MiB GOGC=50 %q -config %q >> %q 2>&1 &
 fi
 
 OK=0
 for i in 1 2 3 4 5 6; do
     sleep 1
-    if wget -qO- "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q '"status":"ok"' || curl -fsS "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    if wget -qO- "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q || curl -fsS "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q; then
         OK=1
+        echo "[watchdog] verified new version %s is live on port %s" >> %q
         break
     fi
 done
 
 if [ "$OK" = "0" ] && [ -f "%s.bak" ]; then
     echo "[watchdog] new binary failed health check, rolling back to .bak" >> %q
+    killall -9 reader 2>/dev/null || true
     cp -f "%s.bak" %q
     chmod +x %q
     if [ -x /etc/init.d/reader ]; then
         /etc/init.d/reader restart >> %q 2>&1 || /etc/init.d/reader start >> %q 2>&1
-    else
-        TMPDIR=%q GOMEMLIMIT=120MiB GOGC=50 %q -config %q >> %q 2>&1 &
     fi
+    sleep 1
+    TMPDIR=%q GOMEMLIMIT=120MiB GOGC=50 %q -config %q >> %q 2>&1 &
 fi
-`, logFile, logFile, os.Getpid(), tmpDir, exePath, cfgPath, logFile, port, port, exePath, logFile, exePath, exePath, exePath, logFile, logFile, tmpDir, exePath, cfgPath, logFile)
+`,
+		oldPID, exePath, expectedVersion, logFile,
+		oldPID, oldPID,
+		logFile, logFile,
+		port, expectedVersion, port, expectedVersion,
+		exePath, logFile,
+		tmpDir, exePath, cfgPath, logFile,
+		port, expectedVersion, port, expectedVersion,
+		expectedVersion, port, logFile,
+		exePath, logFile,
+		exePath, exePath, exePath,
+		logFile, logFile,
+		tmpDir, exePath, cfgPath, logFile,
+	)
 
 	cmd := exec.Command("/bin/sh", "-c", script)
 	_ = cmd.Start()

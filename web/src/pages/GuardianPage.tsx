@@ -591,6 +591,11 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
             </button>
           )}
         </div>
+        {statusMsg && (
+          <p class="status-notice" style={{ marginTop: '8px' }}>
+            {statusMsg}
+          </p>
+        )}
         {updateInfo && (
           <p class="copy-feedback" style={{ marginTop: '8px' }}>
             仓库：{updateInfo.repo} ｜ 最新版本：{updateInfo.latest_version}
