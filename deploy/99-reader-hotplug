@@ -1,0 +1,8 @@
+#!/bin/sh
+# /etc/hotplug.d/block/99-reader
+# Automatically starts reader service when external storage with .reader-disk is mounted
+
+if [ "$ACTION" = "add" ] && [ -f "/mnt/sda1/reader/.reader-disk" ]; then
+    logger -t reader "External storage mounted at /mnt/sda1/reader, starting reader service..."
+    /etc/init.d/reader start
+fi
