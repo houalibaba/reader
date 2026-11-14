@@ -66,7 +66,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
           else
-            VERSION="v0.3.${GITHUB_RUN_NUMBER}"
+            VERSION="v0.3.6"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${VERSION}"
