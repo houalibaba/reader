@@ -105,8 +105,8 @@ jobs:
             -o ../dist/reader-linux-arm64 ./cmd/reader
           cd ..
           file dist/reader-linux-amd64 dist/reader-linux-arm64
-          # Verify execution on pre-AVX/pre-BMI CPU model (core2duo / Atom Cherry Trail compatible)
-          qemu-x86_64 -cpu core2duo ./dist/reader-linux-amd64 -version
+          # Verify on an SSE4.2-capable, pre-AVX CPU (compatible with Atom x5-Z8350; no AVX/BMI)
+          qemu-x86_64 -cpu Nehalem-v1 ./dist/reader-linux-amd64 -version
 
       - name: Generate SHA256 checksums
         run: |
