@@ -1,0 +1,117 @@
+name: Build and Release Reader
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install musl & arm64 toolchains and generate full 20,902 Unihan Pinyin table
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu python3-pip file
+          pip3 install --break-system-packages pypinyin || pip3 install pypinyin
+          python3 - << 'PYEOF'
+          import json
+          from pypinyin import pinyin, Style
+          lines = [
+              "package content",
+              "",
+              "func init() {",
+              "\tfor ch, py := range unihanFullPinyinMap {",
+              "\t\tif _, exists := SingleCharDict[ch]; !exists {",
+              "\t\t\tSingleCharDict[ch] = struct{ Pinyin string; Poly bool }{Pinyin: py, Poly: false}",
+              "\t\t}",
+              "\t}",
+              "}",
+              "",
+              "var unihanFullPinyinMap = map[string]string{",
+          ]
+          for cp in range(0x4E00, 0x9FA6):
+              ch = chr(cp)
+              res = pinyin(ch, style=Style.TONE, heteronym=False)
+              if res and res[0] and res[0][0] != ch:
+                  lines.append(f'\t{json.dumps(ch, ensure_ascii=False)}: {json.dumps(res[0][0], ensure_ascii=False)},')
+          lines.append("}")
+          with open("server/internal/content/unihan_full_gen.go", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          print("Generated unihan_full_gen.go covering all 20,902 CJK characters.")
+          PYEOF
+
+      - name: Determine release version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="v0.3.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Build web frontend
+        run: |
+          cd web
+          npm install
+          npm run build
+
+      - name: Tidy Go modules and run unit tests
+        run: |
+          cd server
+          go mod tidy
+          go test -v ./...
+
+      - name: Build pure static linux-amd64 (musl) & linux-arm64 binaries and verify execution
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -linkmode external -extldflags '-static' -X reader/server/internal/updater.CurrentVersion=${{ steps.version.outputs.version }}"
+          cd server
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=musl-gcc \
+            go build -trimpath -ldflags="${LDFLAGS}" \
+            -o ../dist/reader-linux-amd64 ./cmd/reader
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+            go build -trimpath -ldflags="${LDFLAGS}" \
+            -o ../dist/reader-linux-arm64 ./cmd/reader
+          cd ..
+          file dist/reader-linux-amd64 dist/reader-linux-arm64
+          ./dist/reader-linux-arm64 -version 2>/dev/null || ./dist/reader-linux-amd64 -version
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum reader-linux-amd64 reader-linux-arm64 > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Reader ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            dist/reader-linux-amd64
+            dist/reader-linux-arm64
+            dist/checksums.txt
