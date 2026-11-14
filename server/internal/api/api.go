@@ -569,85 +569,62 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	}
 
 	var prompt strings.Builder
-	prompt.WriteString("请为正在学习中文阅读的儿童编写一篇【10分钟阅读量（约 360~450 字，共 4 个章节、16~20 句话）】的趣味分级绘本故事。
+prompt.WriteString("请为正在学习中文阅读的儿童编写一篇【10分钟阅读量（约 360~450 字，共 4 个章节、16~20 句话）】的趣味分级绘本故事。\n\n")
+prompt.WriteString("【一、十分钟阅读科学字数与最近发展区（ZPD）配比】\n")
+prompt.WriteString("- 目标阅读时长：10 分钟（按小学一年级儿童点读与理解速度 36~45 字/分钟测算）。\n")
+prompt.WriteString("- 篇幅与句长：共 4 个章节、16~20 句话（每页 1 句话，每句 18~24 个汉字，总字数 360~450 字）。\n")
+prompt.WriteString("- 科学识字配比（90%~92% 已掌握熟字 + 8%~10% 目标生字）：\n")
+prompt.WriteString(fmt.Sprintf("  1) 已掌握字词基座（占全篇总字数的 90%%~92%%，约 330~410 字次）：完整复用下方列出的全部已掌握字词（共 %d 个历史已掌握字音 + 基础高频熟字基座）。\n", len(familiarAnchors)))
+prompt.WriteString(fmt.Sprintf("  2) 科学比例生字池（占全篇总字数的 8%%~10%%，约 30~40 字次）：由系统根据【艾宾浩斯遗忘曲线】算出的 %d 个待复习生字 + %d 个全新拓展生字组成，每个生字在文中不同章节自然复现 2~3 次。\n\n", forgettingCount, len(newCandidates)))
 
-")
-	prompt.WriteString("【一、十分钟阅读科学字数与最近发展区（ZPD）配比】
-")
-	prompt.WriteString("- 目标阅读时长：10 分钟（按小学一年级儿童点读与理解速度 36~45 字/分钟测算）。
-")
-	prompt.WriteString("- 篇幅与句长：共 4 个章节、16~20 句话（每页 1 句话，每句 18~24 个汉字，总字数 360~450 字）。
-")
-	prompt.WriteString("- 科学识字配比（90%~92% 已掌握熟字 + 8%~10% 目标生字）：
-")
-	prompt.WriteString(fmt.Sprintf("  1) 已掌握字词基座（占全篇总字数的 90%%~92%%，约 330~410 字次）：完整复用下方列出的全部已掌握字词（共 %d 个历史已掌握字音 + 基础高频熟字基座）。
-", len(familiarAnchors)))
-	prompt.WriteString(fmt.Sprintf("  2) 科学比例生字池（占全篇总字数的 8%%~10%%，约 30~40 字次）：由系统根据【艾宾浩斯遗忘曲线】算出的 %d 个待复习生字 + %d 个全新拓展生字组成，每个生字在文中不同章节自然复现 2~3 次。
+prompt.WriteString("【二、孩子已掌握的全部字词库（占全篇 90%~92%，请全面复用作为故事主干，切勿超纲使用未学过的生僻字）】\n")
+if len(familiarAnchors) > 0 {
+var famParts []string
+for _, t := range familiarAnchors {
+famParts = append(famParts, fmt.Sprintf("%s(%s：%s)", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/")))
+}
+prompt.WriteString(fmt.Sprintf("- 历史已掌握的全部字词（共 %d 项，完整列出）：%s\n", len(familiarAnchors), strings.Join(famParts, "、")))
+} else {
+prompt.WriteString("- 历史已掌握字词：当前为初始建档阶段，尚无完整历史熟字记录，请直接使用下方基础高频熟字基座。\n")
+}
+prompt.WriteString(fmt.Sprintf("- 基础高频熟字与语法脚手架：%s\n\n", foundationalScaffoldWords))
 
-", forgettingCount, len(newCandidates)))
+prompt.WriteString("【三、十分钟阅读科学比例生字池（占全篇 8%~10%：艾宾浩斯遗忘曲线复习字 + 新拓展生字）】\n")
+if len(reviewTargets) > 0 {
+var parts []string
+for _, t := range reviewTargets {
+parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
+}
+prompt.WriteString("1. 遗忘曲线急需复习生字（高频求助/接近遗忘临界点）：" + strings.Join(parts, "、") + "\n")
+}
+if len(observeTargets) > 0 {
+var parts []string
+for _, t := range observeTargets {
+parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
+}
+prompt.WriteString("2. 遗忘曲线待巩固生字（短期记忆巩固节点）：" + strings.Join(parts, "、") + "\n")
+}
+if len(reviewTargets) == 0 && len(observeTargets) == 0 {
+prompt.WriteString("1. 遗忘曲线待复习生字：当前无处于遗忘临界点的历史生字。\n")
+}
+if len(newCandidates) > 0 {
+var parts []string
+for _, t := range newCandidates {
+wSample := t.RecommendedWords
+if len(wSample) > 2 {
+wSample = wSample[:2]
+}
+parts = append(parts, fmt.Sprintf("「%s(%s，推荐词组：%s)」（要求跨章节自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(wSample, "/"), t.TargetRepetitions))
+}
+prompt.WriteString(fmt.Sprintf("3. 按科学比例新引入的拓展生字（共 %d 个，占全篇约 4%%~5%% 字次）：%s\n", len(newCandidates), strings.Join(parts, "、")))
+}
 
-	prompt.WriteString("【二、孩子已掌握的全部字词库（占全篇 90%~92%，请全面复用作为故事主干，切勿超纲使用未学过的生僻字）】
-")
-	if len(familiarAnchors) > 0 {
-		var famParts []string
-		for _, t := range familiarAnchors {
-			famParts = append(famParts, fmt.Sprintf("%s(%s：%s)", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/")))
-		}
-		prompt.WriteString(fmt.Sprintf("- 历史已掌握的全部字词（共 %d 项，完整列出）：%s
-", len(familiarAnchors), strings.Join(famParts, "、")))
-	} else {
-		prompt.WriteString("- 历史已掌握字词：当前为初始建档阶段，尚无完整历史熟字记录，请直接使用下方基础高频熟字基座。
-")
-	}
-	prompt.WriteString(fmt.Sprintf("- 基础高频熟字与语法脚手架：%s
+prompt.WriteString("\n【四、排版与多音字语境强约束】\n")
+prompt.WriteString("- 请直接输出故事正文，每行严格对应 1 句话（共 16~20 行，或精简模式至少 5~8 行），不要输出多余解释。\n")
+prompt.WriteString("- 多音字必须严格匹配上述指定读音的语境词组（例如要求复习 háng 时使用“一行/银行”，要求复习 xíng 时使用“行走/通行”）。\n")
+prompt.WriteString("- 遗忘曲线复习字与新拓展生字应分布在故事的起承转合不同段落中（首次出现有上下文线索、中段复现、结尾巩固），严禁生硬堆砌。")
 
-", foundationalScaffoldWords))
-
-	prompt.WriteString("【三、十分钟阅读科学比例生字池（占全篇 8%~10%：艾宾浩斯遗忘曲线复习字 + 新拓展生字）】
-")
-	if len(reviewTargets) > 0 {
-		var parts []string
-		for _, t := range reviewTargets {
-			parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
-		}
-		prompt.WriteString("1. 遗忘曲线急需复习生字（高频求助/接近遗忘临界点）：" + strings.Join(parts, "、") + "
-")
-	}
-	if len(observeTargets) > 0 {
-		var parts []string
-		for _, t := range observeTargets {
-			parts = append(parts, fmt.Sprintf("「%s(%s)」（推荐词组：%s；状态：%s；要求自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(t.RecommendedWords, "/"), t.ForgettingStage, t.TargetRepetitions))
-		}
-		prompt.WriteString("2. 遗忘曲线待巩固生字（短期记忆巩固节点）：" + strings.Join(parts, "、") + "
-")
-	}
-	if len(reviewTargets) == 0 && len(observeTargets) == 0 {
-		prompt.WriteString("1. 遗忘曲线待复习生字：当前无处于遗忘临界点的历史生字。
-")
-	}
-	if len(newCandidates) > 0 {
-		var parts []string
-		for _, t := range newCandidates {
-			wSample := t.RecommendedWords
-			if len(wSample) > 2 {
-				wSample = wSample[:2]
-			}
-			parts = append(parts, fmt.Sprintf("「%s(%s，推荐词组：%s)」（要求跨章节自然复现 ≥%d 次）", t.Character, t.Pinyin, strings.Join(wSample, "/"), t.TargetRepetitions))
-		}
-		prompt.WriteString(fmt.Sprintf("3. 按科学比例新引入的拓展生字（共 %d 个，占全篇约 4%%~5%% 字次）：%s
-", len(newCandidates), strings.Join(parts, "、")))
-	}
-
-	prompt.WriteString("
-【四、排版与多音字语境强约束】
-")
-	prompt.WriteString("- 请直接输出故事正文，每行严格对应 1 句话（共 16~20 行，或精简模式至少 5~8 行），不要输出多余解释。
-")
-	prompt.WriteString("- 多音字必须严格匹配上述指定读音的语境词组（例如要求复习 háng 时使用“一行/银行”，要求复习 xíng 时使用“行走/通行”）。
-")
-	prompt.WriteString("- 遗忘曲线复习字与新拓展生字应分布在故事的起承转合不同段落中（首次出现有上下文线索、中段复现、结尾巩固），严禁生硬堆砌。")
-
-	return &childStoryPlanResult{
+return &childStoryPlanResult{
 		ChildID: childID,
 		Summary: map[string]any{
 			"total_tracked_char_pinyins":  totalTracked,
