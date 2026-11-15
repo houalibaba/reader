@@ -999,18 +999,18 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = rows.Close() }()
 
 	type storyItem struct {
-		ID                 string `json:"id"`
-		Title              string `json:"title"`
-		Theme              string `json:"theme"`
-		Description        string `json:"description"`
-		CoverURL           string `json:"cover_url"`
-		LatestVersionID    string `json:"latest_version_id"`
-		VersionNumber      int    `json:"version_number"`
-		SentenceCount      int    `json:"sentence_count"`
-		ActiveSessionID    string `json:"active_session_id,omitempty"`
-		ResumeSentenceIdx  int    `json:"resume_sentence_index"`
-		ReviewCharCount    int    `json:"review_char_count"`
-		RecommendedReason  string `json:"recommended_reason,omitempty"`
+		ID                string `json:"id"`
+		Title             string `json:"title"`
+		Theme             string `json:"theme"`
+		Description       string `json:"description"`
+		CoverURL          string `json:"cover_url"`
+		LatestVersionID   string `json:"latest_version_id"`
+		VersionNumber     int    `json:"version_number"`
+		SentenceCount     int    `json:"sentence_count"`
+		ActiveSessionID   string `json:"active_session_id,omitempty"`
+		ResumeSentenceIdx int    `json:"resume_sentence_index"`
+		ReviewCharCount   int    `json:"review_char_count"`
+		RecommendedReason string `json:"recommended_reason,omitempty"`
 	}
 
 	list := []storyItem{}
@@ -1291,7 +1291,92 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// 只要退出阅读界面（无论是读完点“读完啦” finished，还是中途点“保存并返回书架” user_exit），
+	// 都立即在后台根据目前已读句子的点字记录，重新计算遗忘曲线并同步到 GitHub Gist
+	isExitingReader := payload.SessionStatus == "completed" ||
+		payload.SessionStatus == "abandoned" ||
+		payload.EndReason == "user_exit" ||
+		payload.EndReason == "finished"
+
+	if isExitingReader {
+		go s.syncSessionPromptToGist(sessionID, payload.SessionStatus, payload.EndReason)
+	}
+
 	writeJSON(w, http.StatusOK, res)
+}
+
+// syncSessionPromptToGist 根据退出阅读时的 sessionID 查出 child_id，生成最新提示词并覆盖更新至 Gist
+func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var childID, childName string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT rs.child_id, COALESCE(c.name, '')
+		FROM reading_sessions rs
+		LEFT JOIN children c ON c.id = rs.child_id
+		WHERE rs.id = ?
+	`, sessionID).Scan(&childID, &childName)
+	if err != nil || childID == "" {
+		return
+	}
+
+	plan, err := s.buildChildStoryPlan(ctx, childID)
+	if err != nil || plan == nil || strings.TrimSpace(plan.StoryGenerationPrompt) == "" {
+		return
+	}
+
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Now().In(loc)
+	version := now.Format("20060102150405")
+	updatedAt := now.Format("2006-01-02 15:04:05")
+
+	triggerType := "completed"
+	if endReason == "user_exit" && sessionStatus != "completed" {
+		triggerType = "partial_exit (中途保存退出)"
+	}
+
+	metaHeader := fmt.Sprintf(
+		"<!-- READING_SYNC_META\nversion: %s\nupdated_at: %s\nchild_id: %s\nchild_name: %s\nsession_id: %s\ntrigger: %s\n-->\n\n",
+		version, updatedAt, childID, childName, sessionID, triggerType,
+	)
+	fullContent := metaHeader + plan.StoryGenerationPrompt
+
+	const gistID = "aa8591c33578eb903d881cd133ec8fc3"
+	githubToken := strings.TrimSpace(os.Getenv("GITHUB_GIST_TOKEN"))
+	if githubToken == "" {
+		return
+	}
+
+	reqBody := map[string]any{
+		"description": fmt.Sprintf("自适应阅读 10 分钟科学配比 AI 提示词 (最新更新: %s [%s])", updatedAt, triggerType),
+		"files": map[string]any{
+			"next_prompt.md": map[string]string{
+				"content": fullContent,
+			},
+		},
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "https://api.github.com/gists/"+gistID, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+githubToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "reader-gist-sync/1.0")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
 }
 
 func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
@@ -1481,7 +1566,6 @@ func (s *Server) buildJSONExport(ctx context.Context) (map[string]any, error) {
 	out["character_events"] = charEvents
 	return out, nil
 }
-
 
 func (s *Server) handleAdminUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
