@@ -24,38 +24,97 @@ BUILTIN_THEMES: List[Dict[str, str]] = [
     {"id": "minecraft_story", "name": "我的世界·故事模式", "description": "在方块世界里搭木桥、点亮火把、勇敢探险"},
 ]
 
-# Expanded 1st-grade core character & word pool for scientific new-character introduction
+# Expanded 320-character 1st-grade & adventure graded core pool for scientific new-character introduction
+# Ordered by frequency, structural composability, and kid-friendly narrative utility
 COMMON_STARTER_CHARS: List[Tuple[str, str, str]] = [
-    ("水", "shuǐ", "河水"),
-    ("火", "huǒ", "火把"),
-    ("山", "shān", "高山"),
-    ("木", "mù", "木桥"),
-    ("日", "rì", "日出"),
-    ("月", "yuè", "月亮"),
-    ("大", "dà", "大家"),
-    ("小", "xiǎo", "小熊"),
-    ("上", "shàng", "上面"),
-    ("下", "xià", "下面"),
-    ("左", "zuǒ", "左边"),
-    ("右", "yòu", "右边"),
-    ("风", "fēng", "春风"),
-    ("雨", "yǔ", "大雨"),
-    ("花", "huā", "花朵"),
-    ("草", "cǎo", "青草"),
-    ("鸟", "niǎo", "小鸟"),
-    ("鱼", "yú", "小鱼"),
-    ("石", "shí", "石头"),
-    ("光", "guāng", "星光"),
-    ("桥", "qiáo", "木桥"),
-    ("林", "lín", "森林"),
-    ("灯", "dēng", "红灯"),
-    ("宝", "bǎo", "宝石"),
-    ("船", "chuán", "飞船"),
-    ("海", "hǎi", "大海"),
-    ("星", "xīng", "星星"),
-    ("云", "yún", "白云"),
-    ("路", "lù", "小路"),
-    ("家", "jiā", "回家"),
+    # Tier 1: Nature, Orientation & Basic Elements (1-40)
+    ("水", "shuǐ", "河水"), ("火", "huǒ", "火把"), ("山", "shān", "高山"), ("木", "mù", "木桥"),
+    ("日", "rì", "日出"), ("月", "yuè", "月亮"), ("大", "dà", "大家"), ("小", "xiǎo", "小熊"),
+    ("上", "shàng", "上面"), ("下", "xià", "下面"), ("左", "zuǒ", "左边"), ("右", "yòu", "右边"),
+    ("风", "fēng", "春风"), ("雨", "yǔ", "大雨"), ("花", "huā", "花朵"), ("草", "cǎo", "青草"),
+    ("鸟", "niǎo", "小鸟"), ("鱼", "yú", "小鱼"), ("石", "shí", "石头"), ("光", "guāng", "星光"),
+    ("桥", "qiáo", "木桥"), ("林", "lín", "森林"), ("灯", "dēng", "红灯"), ("宝", "bǎo", "宝石"),
+    ("船", "chuán", "飞船"), ("海", "hǎi", "大海"), ("星", "xīng", "星星"), ("云", "yún", "白云"),
+    ("路", "lù", "小路"), ("家", "jiā", "回家"), ("土", "tǔ", "泥土"), ("田", "tián", "田野"),
+    ("河", "hé", "小河"), ("江", "jiāng", "江水"), ("湖", "hú", "湖面"), ("泉", "quán", "泉水"),
+    ("雪", "xuě", "白雪"), ("雷", "léi", "雷声"), ("电", "diàn", "闪电"), ("虹", "hóng", "彩虹"),
+    # Tier 2: Body, People & Daily Life (41-90)
+    ("口", "kǒu", "门口"), ("耳", "ěr", "耳朵"), ("目", "mù", "目光"), ("手", "shǒu", "双手"),
+    ("足", "zú", "足球"), ("头", "tóu", "石头"), ("发", "fà", "头发"), ("牙", "yá", "牙齿"),
+    ("心", "xīn", "开心"), ("力", "lì", "力气"), ("气", "qì", "空气"), ("声", "shēng", "声音"),
+    ("爸", "bà", "爸爸"), ("妈", "mā", "妈妈"), ("爷", "yé", "爷爷"), ("奶", "nǎi", "奶奶"),
+    ("哥", "gē", "哥哥"), ("姐", "jiě", "姐姐"), ("弟", "dì", "弟弟"), ("妹", "mèi", "妹妹"),
+    ("友", "yǒu", "朋友"), ("师", "shī", "老师"), ("生", "shēng", "学生"), ("王", "wáng", "国王"),
+    ("主", "zhǔ", "公主"), ("士", "shì", "勇士"), ("队", "duì", "队长"), ("伴", "bàn", "伙伴"),
+    ("门", "mén", "大门"), ("窗", "chuāng", "窗户"), ("房", "fáng", "房子"), ("屋", "wū", "木屋"),
+    ("床", "chuáng", "小床"), ("桌", "zhuō", "桌子"), ("椅", "yǐ", "椅子"), ("书", "shū", "看书"),
+    ("笔", "bǐ", "画笔"), ("纸", "zhǐ", "白纸"), ("包", "bāo", "书包"), ("衣", "yī", "衣服"),
+    ("帽", "mào", "帽子"), ("鞋", "xié", "鞋子"), ("伞", "sǎn", "雨伞"), ("钟", "zhōng", "时钟"),
+    ("镜", "jìng", "镜子"), ("箱", "xiāng", "宝箱"), ("钥", "yào", "钥匙"), ("匙", "shi", "钥匙"),
+    ("锁", "suǒ", "门锁"), ("梯", "tī", "梯子"),
+    # Tier 3: High-Frequency Action Verbs (91-160)
+    ("走", "zǒu", "行走"), ("跑", "pǎo", "奔跑"), ("跳", "tiào", "跳高"), ("飞", "fēi", "飞翔"),
+    ("游", "yóu", "游泳"), ("爬", "pá", "爬山"), ("站", "zhàn", "站立"), ("坐", "zuò", "坐下"),
+    ("躺", "tǎng", "躺下"), ("睡", "shuì", "睡觉"), ("醒", "xǐng", "醒来"), ("起", "qǐ", "起床"),
+    ("吃", "chī", "吃饭"), ("喝", "hē", "喝水"), ("吹", "chuī", "吹风"), ("吸", "xī", "呼吸"),
+    ("笑", "xiào", "微笑"), ("哭", "kū", "哭泣"), ("喊", "hǎn", "大喊"), ("叫", "jiào", "叫声"),
+    ("唱", "chàng", "唱歌"), ("问", "wèn", "提问"), ("答", "dá", "回答"), ("讲", "jiǎng", "讲故事"),
+    ("读", "dú", "读书"), ("写", "xiě", "写字"), ("画", "huà", "画画"), ("算", "suàn", "计算"),
+    ("看", "kàn", "看见"), ("望", "wàng", "遥望"), ("盯", "dīng", "盯着"), ("找", "zhǎo", "寻找"),
+    ("寻", "xún", "寻宝"), ("藏", "cáng", "躲藏"), ("躲", "duǒ", "躲避"), ("追", "zhuī", "追赶"),
+    ("逃", "táo", "逃跑"), ("抓", "zhuā", "抓住"), ("拿", "ná", "拿着"), ("抱", "bào", "拥抱"),
+    ("背", "bēi", "背着"), ("扛", "káng", "扛起"), ("推", "tuī", "推开"), ("拉", "lā", "拉手"),
+    ("举", "jǔ", "举起"), ("放", "fàng", "放下"), ("扔", "rēng", "扔掉"), ("接", "jiē", "接住"),
+    ("敲", "qiāo", "敲门"), ("打", "dǎ", "打开"), ("拍", "pāi", "拍手"), ("挖", "wā", "挖洞"),
+    ("砍", "kǎn", "砍树"), ("种", "zhòng", "种树"), ("浇", "jiāo", "浇水"), ("摘", "zhāi", "摘果"),
+    ("修", "xiū", "修理"), ("建", "jiàn", "建造"), ("搭", "dā", "搭桥"), ("造", "zào", "制造"),
+    ("亮", "liàng", "点亮"), ("灭", "miè", "熄灭"), ("烧", "shāo", "燃烧"), ("烤", "kǎo", "烤火"),
+    ("洗", "xǐ", "洗手"), ("扫", "sǎo", "打扫"), ("帮", "bāng", "帮忙"), ("助", "zhù", "帮助"),
+    ("救", "jiù", "营救"), ("护", "hù", "保护"),
+    # Tier 4: Colors, Adjectives & Sensory States (161-215)
+    ("红", "hóng", "红花"), ("黄", "huáng", "金黄"), ("蓝", "lán", "蔚蓝"), ("绿", "lǜ", "绿叶"),
+    ("白", "bái", "白云"), ("黑", "hēi", "黑夜"), ("金", "jīn", "金色"), ("银", "yín", "银河"),
+    ("彩", "cǎi", "彩色"), ("明", "míng", "光明"), ("暗", "àn", "黑暗"), ("清", "qīng", "清澈"),
+    ("净", "jìng", "干净"), ("美", "měi", "美丽"), ("丽", "lì", "美丽"), ("香", "xiāng", "花香"),
+    ("甜", "tián", "香甜"), ("酸", "suān", "酸甜"), ("苦", "kǔ", "辛苦"), ("辣", "là", "火辣"),
+    ("冷", "lěng", "寒冷"), ("热", "rè", "炎热"), ("暖", "nuǎn", "温暖"), ("凉", "liáng", "清凉"),
+    ("温", "wēn", "温和"), ("柔", "róu", "柔和"), ("软", "ruǎn", "柔软"), ("硬", "yìng", "坚硬"),
+    ("轻", "qīng", "轻松"), ("重", "zhòng", "沉重"), ("快", "kuài", "快乐"), ("慢", "màn", "慢慢"),
+    ("早", "zǎo", "早上"), ("晚", "wǎn", "夜晚"), ("新", "xīn", "新鲜"), ("旧", "jiù", "破旧"),
+    ("高", "gāo", "高兴"), ("低", "dī", "低头"), ("长", "cháng", "长路"), ("短", "duǎn", "短小"),
+    ("宽", "kuān", "宽广"), ("窄", "zhǎi", "狭窄"), ("深", "shēn", "深山"), ("浅", "qiǎn", "浅水"),
+    ("远", "yuǎn", "远方"), ("近", "jìn", "附近"), ("圆", "yuán", "圆月"), ("方", "fāng", "方块"),
+    ("尖", "jiān", "尖尖"), ("平", "píng", "平安"), ("稳", "wěn", "稳稳"), ("险", "xiǎn", "危险"),
+    ("勇", "yǒng", "勇敢"), ("敢", "gǎn", "勇敢"), ("奇", "qí", "奇怪"),
+    # Tier 5: Animals, Plants & Food (216-265)
+    ("牛", "niú", "小牛"), ("羊", "yáng", "山羊"), ("马", "mǎ", "小马"), ("猪", "zhū", "小猪"),
+    ("狗", "gǒu", "小狗"), ("猫", "māo", "小猫"), ("兔", "tù", "白兔"), ("熊", "xióng", "小熊"),
+    ("虎", "hǔ", "老虎"), ("狮", "shī", "狮子"), ("象", "xiàng", "大象"), ("猴", "hóu", "猴子"),
+    ("鹿", "lù", "小鹿"), ("狼", "láng", "大狼"), ("狐", "hú", "狐狸"), ("狸", "li", "狐狸"),
+    ("鸭", "yā", "小鸭"), ("鹅", "é", "白鹅"), ("鸡", "jī", "小鸡"), ("鹰", "yīng", "老鹰"),
+    ("蛙", "wā", "青蛙"), ("龟", "guī", "乌龟"), ("蛇", "shé", "小蛇"), ("龙", "lóng", "恐龙"),
+    ("虫", "chóng", "小虫"), ("蜂", "fēng", "蜜蜂"), ("蝶", "dié", "蝴蝶"), ("蚁", "yǐ", "蚂蚁"),
+    ("虾", "xiā", "小虾"), ("蟹", "xiè", "螃蟹"), ("贝", "bèi", "贝壳"), ("壳", "ké", "贝壳"),
+    ("树", "shù", "大树"), ("叶", "yè", "树叶"), ("根", "gēn", "树根"), ("枝", "zhī", "树枝"),
+    ("竹", "zhú", "竹子"), ("松", "sōng", "松树"), ("柳", "liǔ", "柳树"), ("桃", "táo", "桃子"),
+    ("果", "guǒ", "果子"), ("瓜", "guā", "西瓜"), ("豆", "dòu", "豆子"), ("米", "mǐ", "大米"),
+    ("麦", "mài", "小麦"), ("面", "miàn", "面包"), ("糖", "táng", "糖果"), ("奶", "nǎi", "牛奶"),
+    ("蛋", "dàn", "鸡蛋"), ("肉", "ròu", "烤肉"),
+    # Tier 6: Adventure, Minecraft & Exploration Concepts (266-320)
+    ("块", "kuài", "方块"), ("矿", "kuàng", "矿石"), ("洞", "dòng", "山洞"), ("穴", "xué", "洞穴"),
+    ("岩", "yán", "岩石"), ("浆", "jiāng", "岩浆"), ("沙", "shā", "沙滩"), ("泥", "ní", "泥巴"),
+    ("铁", "tiě", "铁剑"), ("铜", "tóng", "铜门"), ("钻", "zuàn", "钻石"), ("玉", "yù", "美玉"),
+    ("剑", "jiàn", "宝剑"), ("盾", "dùn", "盾牌"), ("弓", "gōng", "弓箭"), ("箭", "jiàn", "射箭"),
+    ("甲", "jiǎ", "盔甲"), ("旗", "qí", "红旗"), ("鼓", "gǔ", "大鼓"), ("号", "hào", "号角"),
+    ("车", "chē", "矿车"), ("轮", "lún", "车轮"), ("轨", "guǐ", "轨道"), ("帆", "fān", "白帆"),
+    ("桨", "jiǎng", "船桨"), ("岛", "dǎo", "海岛"), ("岸", "àn", "对岸"), ("谷", "gǔ", "山谷"),
+    ("坡", "pō", "山坡"), ("顶", "dǐng", "山顶"), ("底", "dǐ", "海底"), ("崖", "yá", "悬崖"),
+    ("村", "cūn", "村庄"), ("城", "chéng", "城堡"), ("塔", "tǎ", "高塔"), ("井", "jǐng", "水井"),
+    ("池", "chí", "水池"), ("园", "yuán", "花园"), ("场", "chǎng", "广场"), ("市", "shì", "集市"),
+    ("信", "xìn", "信件"), ("图", "tú", "地图"), ("秘", "mì", "秘密"), ("密", "mì", "密林"),
+    ("谜", "mí", "谜题"), ("题", "tí", "问题"), ("法", "fǎ", "办法"), ("功", "gōng", "成功"),
+    ("胜", "shèng", "胜利"), ("利", "lì", "顺利"), ("希", "xī", "希望"), ("梦", "mèng", "梦想"),
+    ("世", "shì", "世界"), ("界", "jiè", "世界"), ("探", "tàn", "探险"),
 ]
 
 # Foundational sight-word scaffold so 10-minute stories always have sufficient grammar connectors
@@ -174,6 +233,7 @@ def generate_vocabulary_plan(
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     seen_chars = {r["character"] for r in vocab_records}
+    scaffold_chars = set(FOUNDATIONAL_SCAFFOLD_WORDS.replace("、", ""))
 
     forgetting_review_list: List[Dict[str, Any]] = []
     forgetting_observe_list: List[Dict[str, Any]] = []
@@ -222,8 +282,12 @@ def generate_vocabulary_plan(
     scientific_new_quota = max(3, min(max_new_chars, total_budget - forgetting_curve_count))
 
     new_candidates: List[Dict[str, Any]] = []
+    added_new_set = set()
     for ch, py, sample_word in COMMON_STARTER_CHARS:
-        if ch not in seen_chars:
+        if len(ch) != 1:
+            continue
+        if ch not in seen_chars and ch not in scaffold_chars and ch not in added_new_set:
+            added_new_set.add(ch)
             words = match_words_for_char_pinyin(ch, py)
             if sample_word not in words:
                 words = [sample_word] + words
@@ -304,6 +368,11 @@ def generate_vocabulary_plan(
         ]
     )
 
+    remaining_pool = sum(
+        1 for ch, _, _ in COMMON_STARTER_CHARS
+        if len(ch) == 1 and ch not in seen_chars and ch not in scaffold_chars
+    )
+
     return {
         "summary": {
             "total_tracked_char_pinyins": len(vocab_records),
@@ -312,6 +381,7 @@ def generate_vocabulary_plan(
             "likely_familiar_count": len(familiar_anchors),
             "forgetting_curve_total": len(forgetting_all),
             "new_candidates_count": len(new_candidates),
+            "remaining_starter_pool_count": remaining_pool,
             "reading_duration_minutes": 10,
             "target_total_chars": "360~450",
         },
@@ -353,7 +423,9 @@ def auto_generate_story_from_plan(
         observe_words.extend(t.get("recommended_words") or [t["character"]])
 
     new_words: List[str] = []
+    new_chars: List[str] = []
     for t in plan.get("new_candidates", []):
+        new_chars.append(t["character"])
         new_words.extend(t.get("recommended_words") or [t["character"]])
 
     if llm_api_key and llm_api_url:
@@ -397,6 +469,8 @@ def auto_generate_story_from_plan(
                         "generator": "llm_api",
                         "review_words": review_words,
                         "review_chars": review_chars,
+                        "new_words": new_words,
+                        "new_chars": new_chars,
                     }
         except Exception:
             pass
@@ -405,13 +479,14 @@ def auto_generate_story_from_plan(
     w2 = review_words[1] if len(review_words) > 1 else w1
     w3 = review_words[2] if len(review_words) > 2 else w1
     obs = observe_words[0] if len(observe_words) > 0 else "木桥"
-    new_w = new_words[0] if len(new_words) > 0 else "春风"
+    new_w1 = new_words[0] if len(new_words) > 0 else "春风"
+    new_w2 = new_words[1] if len(new_words) > 1 else new_w1
 
     if any(k in theme for k in ("太空", "星", "月")):
         title = f"小熊的太空{w1}奇遇"
         sentences = [
-            f"夜晚吹着温和的{new_w}，小熊望着月亮想去看美丽的{w1}。",
-            f"他坐上奇妙飞船，看着银河里像{w2}一样闪亮的星光。",
+            f"夜晚吹着温和的{new_w1}，小熊望着月亮想去看美丽的{w1}。",
+            f"他坐上奇妙飞船，带着{new_w2}在银河里寻找闪亮的星光。",
             f"鹿阿姨走过来告诉他，前面有一座彩虹{obs}可以安全通行。",
             f"小熊勇敢地迈开脚步走上{obs}，在星空下找到了发光的{w3}。",
             f"小熊稳稳地完成太空探索，带着{w1}的礼物开心极了！",
@@ -419,8 +494,8 @@ def auto_generate_story_from_plan(
     elif any(k in theme for k in ("海", "鱼", "沙")):
         title = f"小熊与海边{w1}寻宝"
         sentences = [
-            f"迎着温暖的{new_w}，小熊来到通往大海的{w1}。",
-            f"他看着哗哗流淌的{w2}，水里有一群小鱼在快乐游动。",
+            f"迎着温暖的{new_w1}，小熊来到通往大海的{w1}。",
+            f"他看着哗哗流淌的{w2}，岸边的{new_w2}在阳光下闪闪发亮。",
             f"鹿阿姨温和地告诉他，前面有一座安全的{obs}可以通行。",
             f"小熊迈开脚步走过{obs}，在金黄的沙滩与{w3}捡到了漂亮贝壳。",
             f"小熊把贝壳放进小篮子，回望美丽的{w1}开心极了！",
@@ -428,8 +503,8 @@ def auto_generate_story_from_plan(
     elif any(k in theme for k in ("恐龙", "远古", "山")):
         title = f"小熊与小恐龙的{w1}探秘"
         sentences = [
-            f"清晨吹着柔和的{new_w}，小熊和小恐龙来到远古山谷的{w1}。",
-            f"他们看着哗哗流淌的{w2}，想要去对岸的森林寻找美味果子。",
+            f"清晨吹着柔和的{new_w1}，小熊和小恐龙来到远古山谷的{w1}。",
+            f"他们看着哗哗流淌的{w2}，想要去对岸寻找神奇的{new_w2}。",
             f"小恐龙温和地告诉他，前面有一座坚固的{obs}可以安全通行。",
             f"小熊勇敢地迈开脚步行走，在{obs}与{w3}留下了一行脚印。",
             f"他们稳稳地到达对岸的森林，回望美丽的{w1}开心极了！",
@@ -437,8 +512,8 @@ def auto_generate_story_from_plan(
     elif any(k in theme for k in ("友谊", "分享", "果")):
         title = f"小熊在{w1}的分享野餐"
         sentences = [
-            f"沐浴着温暖的{new_w}，小熊带着甜果子来到美丽的{w1}。",
-            f"他看着清澈的{w2}，心里盼着好朋友们快点到来。",
+            f"沐浴着温暖的{new_w1}，小熊带着甜果子来到美丽的{w1}。",
+            f"他看着清澈的{w2}，还准备了大家喜欢的{new_w2}。",
             f"鹿阿姨走过来温和地告诉他，朋友们正从前面的{obs}安全通行。",
             f"大家迈开脚步走过{obs}，围坐在风景优美的{w3}一起分享果子。",
             f"小熊和朋友们在欢笑声中度过美好时光，看着{w1}开心极了！",
@@ -446,8 +521,8 @@ def auto_generate_story_from_plan(
     elif any(k in theme for k in ("日常", "习惯")):
         title = f"小熊在{w1}的好习惯"
         sentences = [
-            f"太阳升起吹来温和的{new_w}，小熊早早起床来到门前的{w1}。",
-            f"他看着干净清澈的{w2}，认真地把小脸和小手洗得干干净净。",
+            f"太阳升起吹来温和的{new_w1}，小熊早早起床来到门前的{w1}。",
+            f"他看着干净清澈的{w2}，把自己的{new_w2}整理得整整齐齐。",
             f"鹿阿姨夸奖他真棒，并告诉他前面的{obs}已经可以安全通行。",
             f"小熊背起小书包走上{obs}，沿着整洁的{w3}稳稳地向前行走。",
             f"小熊按时到达森林学校，想起美丽的{w1}心里开心极了！",
@@ -455,8 +530,8 @@ def auto_generate_story_from_plan(
     else:
         title = f"小熊与{w1}的新冒险"
         sentences = [
-            f"小熊来到美丽的{w1}，看到清澈的{new_w}。",
-            f"他看着远处的{w2}，心里想要勇敢地向前行走。",
+            f"小熊来到美丽的{w1}，看到清澈的{new_w1}。",
+            f"他看着远处的{w2}，手里拿着心爱的{new_w2}勇敢向前。",
             f"鹿阿姨温和地告诉他，前面有一座安全的{obs}可以通行。",
             f"小熊迈开脚步走上{obs}，低头又看见哗哗流淌的{w3}。",
             f"小熊稳稳地到达对岸的森林，回望{w1}开心极了！",
@@ -468,6 +543,13 @@ def auto_generate_story_from_plan(
         rw = (t.get("recommended_words") or [ch])[0]
         while full_joined.count(ch) < int(t.get("target_repetitions", 3)):
             sentences.append(f"小熊喜欢{rw}，在{rw}旁边留下了开心的脚印。")
+            full_joined = "".join(sentences)
+
+    for t in plan.get("new_candidates", []):
+        ch = t["character"]
+        nw = (t.get("recommended_words") or [ch])[0]
+        while full_joined.count(ch) < int(t.get("target_repetitions", 3)):
+            sentences.append(f"小熊仔细观察着{nw}，很快学会了关于{nw}的新本领。")
             full_joined = "".join(sentences)
 
     return {
@@ -484,6 +566,8 @@ def auto_generate_story_from_plan(
         "generator": "smart_template",
         "review_words": review_words,
         "review_chars": review_chars,
+        "new_words": new_words,
+        "new_chars": new_chars,
     }
 
 
@@ -501,16 +585,30 @@ def verify_draft_against_plan(sentences: List[str], plan: Dict[str, Any], max_se
         if actual < target:
             missing_reviews.append({"character": ch, "expected_min": target, "actual": actual})
 
+    missing_new_chars = []
+    for item in plan.get("new_candidates", []):
+        ch = item["character"]
+        target = int(item.get("target_repetitions", 3))
+        actual = char_counts.get(ch, 0)
+        if actual < target:
+            missing_new_chars.append({"character": ch, "expected_min": target, "actual": actual})
+
     overlong_sentences = []
     for idx, s in enumerate(sentences):
         if len(s) > max_sentence_len:
             overlong_sentences.append({"sentence_index": idx, "length": len(s), "text": s})
 
-    passed = (len(missing_reviews) == 0) and (len(overlong_sentences) == 0) and (len(sentences) >= 3)
+    passed = (
+        (len(missing_reviews) == 0)
+        and (len(missing_new_chars) == 0)
+        and (len(overlong_sentences) == 0)
+        and (len(sentences) >= 3)
+    )
     return {
         "passed": passed,
         "sentence_count": len(sentences),
         "missing_review_targets": missing_reviews,
+        "missing_new_candidates": missing_new_chars,
         "overlong_sentences": overlong_sentences,
     }
 
