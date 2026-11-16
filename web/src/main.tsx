@@ -11,6 +11,8 @@ import { GuardianPage } from './pages/GuardianPage';
 import { ReaderPage } from './pages/ReaderPage';
 import { eventQueue } from './queue/offlineQueue';
 import './styles.css';
+import './reader-theme.css';
+import './admin-theme.css';
 
 export function App() {
   const [children, setChildren] = useState<ChildProfile[]>([]);
@@ -26,10 +28,15 @@ export function App() {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [openingStoryId, setOpeningStoryId] = useState<string | null>(null);
 
+  useEffect(() => {
+    document.body.dataset.mode = showGuardian ? 'admin' : 'reader';
+  }, [showGuardian]);
+
   const loadInitialData = async (selectedChildId?: string) => {
     try {
       setErrorMsg('');
       let kids = await apiClient.listChildren();
+      // Auto-initialize a default child profile on fresh install so "开始阅读" works immediately
       if (kids.length === 0) {
         const defaultChild = await apiClient.createChild({
           name: '六六',
@@ -41,6 +48,7 @@ export function App() {
       setChildren(kids);
       const current = kids.find((k) => k.id === selectedChildId) || kids[0] || null;
       setActiveChild(current);
+
       const storyList = await apiClient.listStories(current?.id);
       setStories(storyList);
     } catch (err: any) {
@@ -162,7 +170,15 @@ export function App() {
       </header>
 
       {errorMsg && (
-        <div class="status-notice" style={{ background: '#fef2f2', borderColor: '#ef4444', color: '#991b1b', marginBottom: '16px' }}>
+        <div
+          class="status-notice"
+          style={{
+            background: '#fef2f2',
+            borderColor: '#ef4444',
+            color: '#991b1b',
+            marginBottom: '16px'
+          }}
+        >
           ⚠️ {errorMsg}
         </div>
       )}
@@ -181,6 +197,7 @@ export function App() {
               <span>{c.name}</span>
             </button>
           ))}
+
           <form onSubmit={handleCreateChild} class="inline-add-child">
             <input
               type="text"
@@ -210,6 +227,7 @@ export function App() {
           >
             👨‍👧 家长陪读
           </button>
+
           <label class="pinyin-toggle">
             <input
               type="checkbox"
@@ -230,7 +248,11 @@ export function App() {
         ) : (
           <div class="story-grid">
             {stories.map((st) => (
-              <article key={st.id} class="story-card">
+              <article
+                key={st.id}
+                class="story-card"
+                style={{ height: 'auto', containerType: 'normal' }}
+              >
                 <div class="story-card-badge">{st.theme || '童话故事'}</div>
                 <h3>{st.title}</h3>
                 <p class="story-desc">{st.description}</p>
@@ -240,6 +262,7 @@ export function App() {
                     <span class="recommend-tag">✨ {st.recommended_reason}</span>
                   )}
                 </div>
+
                 <div class="story-actions">
                   {st.active_session_id ? (
                     <>
@@ -249,7 +272,9 @@ export function App() {
                         disabled={openingStoryId === st.id}
                         onClick={() => handleOpenStory(st, false)}
                       >
-                        {openingStoryId === st.id ? '正在打开...' : `继续读（第 ${st.resume_sentence_index + 1} 句）`}
+                        {openingStoryId === st.id
+                          ? '正在打开...'
+                          : `继续读（第 ${st.resume_sentence_index + 1} 句）`}
                       </button>
                       <button
                         type="button"

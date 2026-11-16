@@ -1,0 +1,341 @@
+/* ==========================================================================
+   reader-theme.css — 儿童平板触控点读轻量级原生 CSS 视觉规范
+   兼容现有 ReaderPage / SentenceDisplay 类名与新一代语义卡片结构
+   ========================================================================== */
+
+:root {
+  /* 表面与卡片层次（暖纸张护眼配色） */
+  --bg-canvas: #faf8f5;
+  --bg-card: #ffffff;
+  --bg-surface-subtle: #f2efe9;
+  --border-subtle: rgba(30, 36, 43, 0.08);
+
+  /* 文字高对比层级 */
+  --text-primary: #1e242b;
+  --text-pinyin: #646e7a;
+  --text-muted: #8c96a3;
+
+  /* 语义状态色（点读高亮与艾宾浩斯复习） */
+  --accent-speak-bg: #fff3d6;
+  --accent-speak-ring: #ff9f1c;
+  --accent-word-bg: #ffe9a8;
+  --accent-review-dot: #2ec4b6;
+  --accent-primary: #3a86ff;
+  --accent-audio: #ff8c42;
+
+  /* 流体字号与粗笔画清晰字体 */
+  --font-hanzi: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-pinyin: system-ui, -apple-system, sans-serif;
+  --size-hanzi: clamp(2.25rem, 4.5vw, 3.5rem);
+  --size-pinyin: clamp(0.875rem, 1.5vw, 1.125rem);
+
+  /* 留白与圆角 */
+  --space-outer: clamp(12px, 2.5vw, 28px);
+  --space-card-pad: clamp(16px, 3vw, 32px);
+  --radius-card: 24px;
+  --radius-char: 14px;
+  --radius-pill: 9999px;
+
+  /* 柔和物理阴影 */
+  --shadow-card: 0 8px 28px -6px rgba(30, 36, 43, 0.07),
+                 0 2px 6px -1px rgba(30, 36, 43, 0.04);
+
+  /* 弹簧与顺滑过渡曲线 */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ==========================================================================
+   全局触控保护
+   ========================================================================== */
+*, *::before, *::after {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-hanzi);
+}
+
+/* ==========================================================================
+   儿童阅读主舞台（锁屏一页一句，消除滚动与误触）
+   ========================================================================== */
+.reader-stage {
+  display: grid;
+  grid-template-rows: auto 1fr auto auto;
+  height: 100dvh;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: var(--space-outer);
+  gap: clamp(10px, 1.8vh, 18px);
+  overflow: hidden;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.reader-topbar,
+.reader-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 6px;
+}
+
+.reader-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.reader-title-group h2 {
+  margin: 0;
+  font-size: clamp(1.05rem, 2vw, 1.35rem);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.badge-mode,
+.reader-progress {
+  padding: 6px 14px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-pinyin);
+}
+
+/* ==========================================================================
+   核心绘本插画卡片（支持新page进入平滑过渡）
+   ========================================================================== */
+.reader-illustration-card,
+.story-card {
+  container-type: size;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: clamp(12px, 2vw, 22px);
+  overflow: hidden;
+  transition: transform 0.35s var(--ease-smooth), opacity 0.3s var(--ease-smooth);
+}
+
+@starting-style {
+  .reader-illustration-card,
+  .story-card {
+    opacity: 0;
+    transform: translateY(8px) scale(0.988);
+  }
+}
+
+.reader-illustration-card img.story-image,
+.illustration-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: calc(var(--radius-card) - 8px);
+  display: block;
+}
+
+.story-image-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-surface-subtle);
+  border-radius: calc(var(--radius-card) - 8px);
+  color: var(--text-pinyin);
+  font-size: 1.05rem;
+}
+
+/* ==========================================================================
+   单句点读文字区与大尺寸触控热区（兼容 SentenceDisplay.tsx）
+   ========================================================================== */
+.sentence-tokens-wrap,
+.sentence-area {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  align-content: center;
+  gap: 10px 12px;
+  padding: clamp(14px, 2.2vh, 24px) 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+
+.char-hitbox,
+.char-token {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 56px;
+  min-height: 68px;
+  padding: 6px 8px;
+  border-radius: var(--radius-char);
+  background: transparent;
+  border: 2px solid transparent;
+  font-family: var(--font-hanzi);
+  cursor: pointer;
+  transition: transform 0.22s var(--ease-spring),
+              background-color 0.18s ease,
+              border-color 0.18s ease;
+}
+
+.char-punct,
+.char-token[data-punct="true"] {
+  min-width: 26px;
+  padding: 6px 2px;
+  margin-left: -6px;
+  pointer-events: none;
+}
+
+.char-pinyin {
+  font-family: var(--font-pinyin);
+  font-size: var(--size-pinyin);
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-pinyin);
+  margin-bottom: 4px;
+  letter-spacing: 0.02em;
+}
+
+.char-glyph,
+.char-hanzi {
+  font-size: var(--size-hanzi);
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--text-primary);
+}
+
+/* 按下回弹反馈 */
+.char-hitbox:not(:disabled):active,
+.char-token:active {
+  transform: scale(0.91);
+  background-color: var(--bg-surface-subtle);
+}
+
+/* 所属词语暖黄高亮 */
+.char-hitbox.word-highlighted {
+  background-color: var(--accent-word-bg) !important;
+  border-radius: var(--radius-char) !important;
+}
+
+/* 正在点读单字高亮 + GPU 光晕波纹 */
+.char-hitbox.char-selected,
+.char-token.is-speaking {
+  background-color: var(--accent-speak-bg) !important;
+  border-color: var(--accent-speak-ring);
+  transform: translateY(-3px) scale(1.06);
+}
+
+.char-hitbox.char-selected::after,
+.char-token.is-speaking::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: calc(var(--radius-char) + 4px);
+  border: 2px solid var(--accent-speak-ring);
+  opacity: 0;
+  pointer-events: none;
+  animation: speak-ripple 0.65s var(--ease-smooth) forwards;
+}
+
+@keyframes speak-ripple {
+  0% {
+    opacity: 0.75;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.14);
+  }
+}
+
+/* 点字求助提示横幅 */
+.help-feedback-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 10px 20px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-speak-bg);
+  border: 1.5px solid rgba(255, 159, 28, 0.35);
+  font-size: 1rem;
+  color: var(--text-primary);
+}
+
+/* ==========================================================================
+   底部大拇指友好控制栏（兼容 ReaderPage.tsx 按钮类名）
+   ========================================================================== */
+.reader-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.reader-controls .btn-nav,
+.reader-controls .btn-audio,
+.btn-touch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 112px;
+  min-height: 60px;
+  padding: 0 26px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-hanzi);
+  font-size: 1.15rem;
+  font-weight: 600;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  box-shadow: 0 3px 12px rgba(30, 36, 43, 0.06);
+  cursor: pointer;
+  transition: transform 0.2s var(--ease-spring), background-color 0.15s ease;
+}
+
+.reader-controls .btn-nav:active,
+.reader-controls .btn-audio:active,
+.btn-touch:active {
+  transform: scale(0.93);
+}
+
+.reader-controls .btn-audio {
+  background: #fff6eb;
+  border-color: rgba(255, 140, 66, 0.35);
+  color: #b84a08;
+}
+
+.reader-controls .btn-primary,
+.btn-touch.is-primary {
+  background: var(--accent-primary);
+  border-color: transparent;
+  color: #ffffff;
+}
+
+.reader-controls button:disabled,
+.btn-touch:disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}

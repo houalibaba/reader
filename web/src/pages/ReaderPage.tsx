@@ -34,6 +34,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const hiddenStartedAtRef = useRef<number | null>(null);
   const visitedIndicesRef = useRef<Set<number>>(new Set([session.current_sentence_index || 0]));
   const highlightTimerRef = useRef<number | null>(null);
+  const imageDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const charEventsRef = useRef<QueuedCharacterEvent[]>([]);
   const audioEventsRef = useRef<QueuedAudioEvent[]>([]);
@@ -67,7 +68,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
             exited_at: exitedIso,
             total_elapsed_ms: totalElapsedMs,
             is_revisit: isRevisit,
-            client_version: '0.3.9'
+            client_version: '0.4.0'
           }
         ],
         character_events: [...charEventsRef.current],
@@ -78,6 +79,18 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       keepalive
     );
   };
+
+  useEffect(() => {
+    const dialog = imageDialogRef.current;
+    if (!dialog) return;
+    if (isImageFullscreen) {
+      if (!dialog.open && typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [isImageFullscreen]);
 
   useEffect(() => {
     viewIdRef.current = makeUUID('sv');
@@ -105,7 +118,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       }
     }
 
-    // 借鉴 v0.1.0：静默预加载下一句插图，实现翻页零闪烁
+    // 静默预加载下一句插图，实现翻页零闪烁
     const nextSentence = story.sentences[sentenceIndex + 1];
     if (nextSentence && nextSentence.image_url) {
       const preloadImg = new Image();
@@ -123,7 +136,6 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
           occurred_at: nowIso,
           background_duration_ms: 0
         });
-        // 借鉴 v0.1.0：切后台或直接关闭标签页时，用 keepalive 抢救上报并触发后端 Gist 同步
         void flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
       } else if (document.visibilityState === 'visible' && hiddenStartedAtRef.current !== null) {
         const bgMs = Math.max(0, Math.round(performance.now() - hiddenStartedAtRef.current));
@@ -151,7 +163,6 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     setActiveToken(token);
     setActiveWordIndex(token.word_index);
 
-    // 借鉴 v0.1.0：点字头顶拼音气泡与同词暖黄高亮在 1.5 秒后自动消隐
     if (highlightTimerRef.current !== null) {
       window.clearTimeout(highlightTimerRef.current);
     }
@@ -171,7 +182,6 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       clicked_at: clickedIso
     });
 
-    // 借鉴 v0.1.0：无独立单字音频时优先以整词/单字发声兜底
     await audioPlayer.playUrlOrFallback(token.audio_url, token.character);
   };
 
@@ -219,7 +229,6 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
 
   if (!currentSentence) return null;
 
-  // 借鉴 v0.1.0：读完最后一页展示撒花庆祝过渡面板
   if (isFinishedCelebration) {
     return (
       <div
@@ -237,14 +246,14 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       >
         <div style={{ fontSize: '64px', lineHeight: 1 }}>🎉</div>
         <h1 style={{ fontSize: '28px', margin: '8px 0' }}>读完《{story.title}》啦！</h1>
-        <p style={{ color: '#7a6a5a', fontSize: '16px', margin: 0 }}>
+        <p style={{ color: 'var(--text-pinyin)', fontSize: '16px', margin: 0 }}>
           今日阅读记录与最新 10 分钟科学配比已自动同步！
         </p>
         <button
           type="button"
-          class="btn-nav btn-primary"
+          class="btn-nav btn-primary btn-touch is-primary"
           onClick={onExit}
-          style={{ minWidth: '180px', minHeight: '54px', fontSize: '20px', marginTop: '12px' }}
+          style={{ minWidth: '180px', minHeight: '60px', fontSize: '20px', marginTop: '12px' }}
         >
           再选一本
         </button>
@@ -255,8 +264,8 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   return (
     <div class="reader-stage">
       <header class="reader-topbar">
-        <button type="button" class="btn-secondary" onClick={handleUserExit}>
-          ← 保存并返回书架
+        <button type="button" class="btn-nav" onClick={handleUserExit}>
+          ← 返回书架
         </button>
         <div class="reader-title-group">
           <h2>{story.title}</h2>
@@ -268,13 +277,20 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       </header>
 
       <div
-        class="reader-illustration-card"
+        key={currentSentence.id}
+        class="reader-illustration-card story-card"
         onClick={() => currentSentence.image_url && setIsImageFullscreen(true)}
         style={{ cursor: currentSentence.image_url ? 'zoom-in' : 'default' }}
         title={currentSentence.image_url ? '点击全屏查看插图' : ''}
       >
         {currentSentence.image_url ? (
-          <img src={currentSentence.image_url} alt={story.title} class="story-image" />
+          <img
+            src={currentSentence.image_url}
+            alt={story.title}
+            class="story-image"
+            fetchpriority="high"
+            decoding="async"
+          />
         ) : (
           <div class="story-image-placeholder">
             <span class="placeholder-icon">🏞️</span>
@@ -283,35 +299,39 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
         )}
       </div>
 
-      {isImageFullscreen && currentSentence.image_url && (
-        <div
-          class="reader-image-fullscreen-overlay"
-          onClick={() => setIsImageFullscreen(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 9999,
-            backgroundColor: 'rgba(0, 0, 0, 0.92)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-            cursor: 'zoom-out'
-          }}
-        >
+      <dialog
+        ref={imageDialogRef}
+        onClose={() => setIsImageFullscreen(false)}
+        onClick={(e) => {
+          if (e.target === imageDialogRef.current) {
+            setIsImageFullscreen(false);
+          }
+        }}
+        style={{
+          padding: '16px',
+          border: 'none',
+          borderRadius: '20px',
+          background: 'rgba(18, 22, 27, 0.94)',
+          maxWidth: '94vw',
+          maxHeight: '92dvh',
+          cursor: 'zoom-out'
+        }}
+      >
+        {currentSentence.image_url && (
           <img
             src={currentSentence.image_url}
             alt={story.title}
+            onClick={() => setIsImageFullscreen(false)}
             style={{
-              maxWidth: '100%',
-              maxHeight: '100%',
+              maxWidth: '88vw',
+              maxHeight: '84dvh',
               objectFit: 'contain',
-              borderRadius: '12px',
-              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)'
+              borderRadius: '14px',
+              display: 'block'
             }}
           />
-        </div>
-      )}
+        )}
+      </dialog>
 
       <SentenceDisplay
         tokens={currentSentence.tokens}
