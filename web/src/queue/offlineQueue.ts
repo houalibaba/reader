@@ -94,7 +94,7 @@ export class OfflineEventQueue {
     for (const cb of this.listeners) cb(count);
   }
 
-  async enqueue(envelope: QueuedBatchEnvelope): Promise<void> {
+  async enqueue(envelope: QueuedBatchEnvelope, keepalive = false): Promise<void> {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -103,7 +103,7 @@ export class OfflineEventQueue {
       tx.onerror = () => reject(tx.error);
     });
     await this.notifyCount();
-    void this.flush();
+    void this.flush(keepalive);
   }
 
   async getPendingCount(): Promise<number> {
@@ -120,10 +120,11 @@ export class OfflineEventQueue {
     }
   }
 
-  async flush(): Promise<number> {
-    if (this.flushing) return 0;
+  async flush(keepalive = false): Promise<number> {
+    if (this.flushing && !keepalive) return 0;
     this.flushing = true;
     let sent = 0;
+
     try {
       const db = await openDB();
       const batches = await new Promise<QueuedBatchEnvelope[]>((resolve, reject) => {
@@ -140,6 +141,7 @@ export class OfflineEventQueue {
           const res = await fetch(`/api/v1/sessions/${encodeURIComponent(batch.session_id)}/events`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            keepalive: keepalive,
             body: JSON.stringify({
               current_sentence_index: batch.current_sentence_index,
               session_status: batch.session_status,
@@ -150,6 +152,7 @@ export class OfflineEventQueue {
               visibility_events: batch.visibility_events
             })
           });
+
           if (res.ok) {
             await new Promise<void>((resolve, reject) => {
               const tx = db.transaction(STORE_NAME, 'readwrite');

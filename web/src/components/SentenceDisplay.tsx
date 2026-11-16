@@ -37,10 +37,42 @@ export function SentenceDisplay({
               isWordHighlighted ? 'word-highlighted' : '',
               isCharSelected ? 'char-selected' : ''
             ].join(' ')}
+            style={{
+              position: 'relative',
+              backgroundColor: isWordHighlighted ? '#ffe08a' : undefined,
+              borderRadius: isWordHighlighted ? '12px' : undefined,
+              transition: 'background-color 0.15s ease'
+            }}
             aria-label={isPunct ? tok.character : `汉字 ${tok.character}，所属词 ${tok.word}`}
           >
+            {/* 借鉴 v0.1.0：点字时在汉字正上方弹出悬浮拼音气泡，或开启全局拼音提示时常驻 */}
             {(showPinyinHint || isCharSelected) && !isPunct && hasValidPinyin && (
-              <span class="char-pinyin">{tok.pinyin}</span>
+              <span
+                class="char-pinyin"
+                style={
+                  isCharSelected && !showPinyinHint
+                    ? {
+                        position: 'absolute',
+                        top: '-28px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        fontSize: '18px',
+                        fontWeight: 600,
+                        background: '#fff',
+                        color: '#2b2118',
+                        border: '1px solid #ead9c3',
+                        borderRadius: '8px',
+                        padding: '2px 8px',
+                        whiteSpace: 'nowrap',
+                        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.12)',
+                        zIndex: 20,
+                        pointerEvents: 'none'
+                      }
+                    : undefined
+                }
+              >
+                {tok.pinyin}
+              </span>
             )}
             <span class="char-glyph">{tok.character}</span>
           </button>

@@ -26,16 +26,25 @@ func Open(dbPath string) (*sql.DB, error) {
 
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL;",
+		"PRAGMA wal_autocheckpoint = 1000;",
+		"PRAGMA busy_timeout = 5000;",
 		"PRAGMA foreign_keys = ON;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA temp_store = FILE;",
-		"PRAGMA cache_size = -4000;", // ~4MB page cache limit
+		"PRAGMA mmap_size = 0;",       // Disable mmap to avoid virtual memory spikes on 120MiB router limit
+		"PRAGMA cache_size = -8000;",  // ~8MB page cache cap (from v0.1.0 spec)
 	}
 	for _, p := range pragmas {
 		if _, err := conn.Exec(p); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("exec pragma %q: %w", p, err)
 		}
+	}
+
+	var checkRes string
+	if err := conn.QueryRow("PRAGMA quick_check;").Scan(&checkRes); err != nil || checkRes != "ok" {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sqlite quick_check failed (%v: %s)", err, checkRes)
 	}
 
 	if err := Migrate(conn); err != nil {

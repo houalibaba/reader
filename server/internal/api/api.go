@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,7 @@ func NewServer(cfg *config.Config, dbConn *sql.DB, webFS fs.FS) *Server {
 		updater:  updater.New(cfg),
 	}
 	go srv.precacheAllPublishedStories()
+	srv.StartDailyStorySyncWorker()
 	return srv
 }
 
@@ -1377,6 +1379,243 @@ func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason str
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+}
+
+// StartDailyStorySyncWorker 每天凌晨 3 点（东八区时间）自动从 GitHub Gist 固定地址读取新故事与配图并防重复入库
+func (s *Server) StartDailyStorySyncWorker() {
+	go func() {
+		loc := time.FixedZone("CST", 8*3600)
+		for {
+			now := time.Now().In(loc)
+			next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, loc)
+			if !now.Before(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			time.Sleep(time.Until(next))
+			s.fetchAndImportLatestStoryFromGist()
+		}
+	}()
+}
+
+type gistStoryPayload struct {
+	Version     string   `json:"version"`
+	StoryID     string   `json:"story_id"`
+	Title       string   `json:"title"`
+	Theme       string   `json:"theme"`
+	Description string   `json:"description"`
+	RawText     string   `json:"raw_text"`
+	Sentences   []string `json:"sentences"`
+	ImageURLs   []string `json:"image_urls"`
+	Images      []string `json:"images"`
+}
+
+func extractMetaField(content, fieldName string) string {
+	prefix := fieldName + ":"
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		}
+	}
+	return ""
+}
+
+// fetchAndImportLatestStoryFromGist 从固定 Gist 拉取新故事（优先读 next_story.json，回退读 next_prompt.md），按 version 判重后自动下载 4 张章节配图并入库
+func (s *Server) fetchAndImportLatestStoryFromGist() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	candidates := []string{
+		"https://gist.githubusercontent.com/houalibaba/aa8591c33578eb903d881cd133ec8fc3/raw/next_story.json",
+		"https://gist.githubusercontent.com/houalibaba/aa8591c33578eb903d881cd133ec8fc3/raw/next_prompt.md",
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	var payload gistStoryPayload
+	var parsedOK bool
+
+	for _, rawURL := range candidates {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?t=%d", rawURL, time.Now().Unix()), nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "reader-gist-sync/1.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		_ = resp.Body.Close()
+		if readErr != nil || resp.StatusCode != http.StatusOK || len(bodyBytes) == 0 {
+			continue
+		}
+
+		contentStr := strings.TrimSpace(string(bodyBytes))
+		metaVer := extractMetaField(contentStr, "version")
+
+		jsonPart := contentStr
+		if idx := strings.Index(jsonPart, "-->"); idx >= 0 {
+			jsonPart = strings.TrimSpace(jsonPart[idx+3:])
+		}
+		if startIdx := strings.Index(jsonPart, "{"); startIdx >= 0 {
+			if endIdx := strings.LastIndex(jsonPart, "}"); endIdx > startIdx {
+				jsonPart = jsonPart[startIdx : endIdx+1]
+			}
+		}
+
+		var p gistStoryPayload
+		if err := json.Unmarshal([]byte(jsonPart), &p); err == nil {
+			if p.Version == "" {
+				p.Version = metaVer
+			}
+			if p.Title != "" && (len(p.Sentences) > 0 || strings.TrimSpace(p.RawText) != "") {
+				payload = p
+				parsedOK = true
+				break
+			}
+		}
+	}
+
+	if !parsedOK || strings.TrimSpace(payload.Version) == "" {
+		return
+	}
+
+	versionTag := "[GistVersion:" + strings.TrimSpace(payload.Version) + "]"
+	var exists int
+	_ = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM stories WHERE description LIKE ?", "%"+versionTag+"%").Scan(&exists)
+	if exists > 0 {
+		return // 该版本已入库，跳过避免重复
+	}
+
+	rawSentences := payload.Sentences
+	if len(rawSentences) == 0 {
+		rawSentences = content.SplitSentences(payload.RawText)
+	}
+	if len(rawSentences) == 0 {
+		return
+	}
+
+	imgLinks := payload.ImageURLs
+	if len(imgLinks) == 0 {
+		imgLinks = payload.Images
+	}
+
+	storyID := strings.TrimSpace(payload.StoryID)
+	if storyID == "" {
+		storyID = newID("story")
+	}
+	theme := strings.TrimSpace(payload.Theme)
+	if theme == "" {
+		theme = "我的世界·故事模式"
+	}
+
+	var maxVer int
+	_ = s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version_number), 0) FROM story_versions WHERE story_id = ?", storyID).Scan(&maxVer)
+	nextVer := maxVer + 1
+	versionID := fmt.Sprintf("%s_v%d", storyID, nextVer)
+
+	// 下载 Gist 传入的 4 张章节配图（兼容 http/https URL、DataURL 或纯 Base64），交由 SaveUserPreparedImages 自动均匀映射到各句
+	var customImages []content.CustomImageUpload
+	for idx, rawImg := range imgLinks {
+		u := strings.TrimSpace(rawImg)
+		if u == "" {
+			continue
+		}
+		fname := fmt.Sprintf("chapter_%02d.webp", idx)
+		var b64Data string
+
+		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			if parsedU, err := url.Parse(u); err == nil {
+				if ext := strings.ToLower(filepath.Ext(parsedU.Path)); ext != "" {
+					fname = fmt.Sprintf("chapter_%02d%s", idx, ext)
+				}
+			}
+			imgReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err != nil {
+				continue
+			}
+			imgReq.Header.Set("User-Agent", "reader-gist-sync/1.0")
+			imgResp, err := client.Do(imgReq)
+			if err != nil {
+				continue
+			}
+			imgBytes, readErr := io.ReadAll(io.LimitReader(imgResp.Body, 8*1024*1024))
+			_ = imgResp.Body.Close()
+			if readErr != nil || imgResp.StatusCode != http.StatusOK || len(imgBytes) == 0 {
+				continue
+			}
+			b64Data = base64.StdEncoding.EncodeToString(imgBytes)
+		} else if strings.HasPrefix(u, "data:") {
+			if commaIdx := strings.Index(u, ","); commaIdx >= 0 {
+				b64Data = strings.TrimSpace(u[commaIdx+1:])
+			}
+		} else {
+			b64Data = u
+		}
+
+		if b64Data != "" {
+			customImages = append(customImages, content.CustomImageUpload{
+				Filename:   fname,
+				DataBase64: b64Data,
+			})
+		}
+	}
+
+	var imageURLs []string
+	if len(customImages) > 0 {
+		imageURLs, _ = content.SaveUserPreparedImages(s.cfg.MediaDir(), storyID, versionID, customImages, len(rawSentences))
+	}
+	if len(imageURLs) == 0 {
+		imageURLs, _ = content.RenderStoryIllustrations(
+			ctx, s.cfg.MediaDir(), storyID, versionID, theme, rawSentences,
+			"", "", "",
+		)
+	}
+
+	var sentences []content.SentenceManifest
+	for idx, sText := range rawSentences {
+		sentID := fmt.Sprintf("%s_s%02d", versionID, idx)
+		imgURL := ""
+		if idx < len(imageURLs) {
+			imgURL = imageURLs[idx]
+		}
+		sentences = append(sentences, content.SentenceManifest{
+			ID:            sentID,
+			SequenceIndex: idx,
+			Text:          sText,
+			ImageURL:      imgURL,
+			Tokens:        content.SegmentAndAnnotate(sentID, sText),
+		})
+	}
+
+	coverURL := ""
+	if len(imageURLs) > 0 {
+		coverURL = imageURLs[0]
+	}
+
+	desc := strings.TrimSpace(payload.Description)
+	if desc == "" {
+		desc = fmt.Sprintf("主题【%s】· 每日凌晨自动同步故事 %s", theme, versionTag)
+	} else if !strings.Contains(desc, versionTag) {
+		desc = desc + " " + versionTag
+	}
+
+	manifest := &content.StoryManifest{
+		StoryID:       storyID,
+		Title:         strings.TrimSpace(payload.Title),
+		Theme:         theme,
+		Description:   desc,
+		CoverURL:      coverURL,
+		VersionID:     versionID,
+		VersionNumber: nextVer,
+		Status:        "published",
+		Sentences:     sentences,
+	}
+
+	if err := s.importer.SaveManifest(ctx, manifest); err != nil {
+		return
+	}
+	go s.precacheStoryVersionAudio(manifest.VersionID)
 }
 
 func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {

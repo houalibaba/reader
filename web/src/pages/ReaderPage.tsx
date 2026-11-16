@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { apiClient, ReadingSession, SentenceToken, StoryVersionDetail } from '../api/client';
+import { ReadingSession, SentenceToken, StoryVersionDetail } from '../api/client';
 import { audioPlayer } from '../audio/player';
 import { SentenceDisplay } from '../components/SentenceDisplay';
 import {
@@ -25,12 +25,15 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
   const [activeToken, setActiveToken] = useState<SentenceToken | null>(null);
   const [playingAudio, setPlayingAudio] = useState<boolean>(false);
+  const [isImageFullscreen, setIsImageFullscreen] = useState<boolean>(false);
+  const [isFinishedCelebration, setIsFinishedCelebration] = useState<boolean>(false);
 
   const viewIdRef = useRef<string>(makeUUID('sv'));
   const enteredAtIsoRef = useRef<string>(new Date().toISOString());
   const enteredAtPerfRef = useRef<number>(performance.now());
   const hiddenStartedAtRef = useRef<number | null>(null);
   const visitedIndicesRef = useRef<Set<number>>(new Set([session.current_sentence_index || 0]));
+  const highlightTimerRef = useRef<number | null>(null);
 
   const charEventsRef = useRef<QueuedCharacterEvent[]>([]);
   const audioEventsRef = useRef<QueuedAudioEvent[]>([]);
@@ -41,35 +44,39 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const flushCurrentSentenceView = async (
     nextIndex: number,
     status: 'active' | 'completed' | 'abandoned' = 'active',
-    endReason = ''
+    endReason = '',
+    keepalive = false
   ) => {
     if (!currentSentence) return;
     const totalElapsedMs = Math.max(0, Math.round(performance.now() - enteredAtPerfRef.current));
     const exitedIso = new Date().toISOString();
     const isRevisit = visitedIndicesRef.current.has(sentenceIndex) && charEventsRef.current.length === 0;
 
-    await eventQueue.enqueue({
-      envelope_id: makeUUID('env'),
-      session_id: session.id,
-      current_sentence_index: nextIndex,
-      session_status: status,
-      end_reason: endReason,
-      sentence_views: [
-        {
-          id: viewIdRef.current,
-          sentence_id: currentSentence.id,
-          entered_at: enteredAtIsoRef.current,
-          exited_at: exitedIso,
-          total_elapsed_ms: totalElapsedMs,
-          is_revisit: isRevisit,
-          client_version: '0.1.0-mvp'
-        }
-      ],
-      character_events: [...charEventsRef.current],
-      audio_events: [...audioEventsRef.current],
-      visibility_events: [...visibilityEventsRef.current],
-      created_at: Date.now()
-    });
+    await eventQueue.enqueue(
+      {
+        envelope_id: makeUUID('env'),
+        session_id: session.id,
+        current_sentence_index: nextIndex,
+        session_status: status,
+        end_reason: endReason,
+        sentence_views: [
+          {
+            id: viewIdRef.current,
+            sentence_id: currentSentence.id,
+            entered_at: enteredAtIsoRef.current,
+            exited_at: exitedIso,
+            total_elapsed_ms: totalElapsedMs,
+            is_revisit: isRevisit,
+            client_version: '0.3.9'
+          }
+        ],
+        character_events: [...charEventsRef.current],
+        audio_events: [...audioEventsRef.current],
+        visibility_events: [...visibilityEventsRef.current],
+        created_at: Date.now()
+      },
+      keepalive
+    );
   };
 
   useEffect(() => {
@@ -81,13 +88,28 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     visibilityEventsRef.current = [];
     setActiveWordIndex(null);
     setActiveToken(null);
+    setIsImageFullscreen(false);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+      highlightTimerRef.current = null;
+    }
 
+    // 预取当前句与单字 TTS 音频
     if (currentSentence) {
       const punct = new Set(['，', '。', '！', '？', '、', '：', '；', '“', '”', '‘', '’', '（', '）']);
       const chars = currentSentence.tokens
         .map((t) => t.character)
         .filter((ch) => !punct.has(ch));
-      audioPlayer.prefetchTexts([currentSentence.text, ...chars]);
+      if (typeof (audioPlayer as any).prefetchTexts === 'function') {
+        (audioPlayer as any).prefetchTexts([currentSentence.text, ...chars]);
+      }
+    }
+
+    // 借鉴 v0.1.0：静默预加载下一句插图，实现翻页零闪烁
+    const nextSentence = story.sentences[sentenceIndex + 1];
+    if (nextSentence && nextSentence.image_url) {
+      const preloadImg = new Image();
+      preloadImg.src = nextSentence.image_url;
     }
 
     const handleVisibilityChange = () => {
@@ -101,6 +123,8 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
           occurred_at: nowIso,
           background_duration_ms: 0
         });
+        // 借鉴 v0.1.0：切后台或直接关闭标签页时，用 keepalive 抢救上报并触发后端 Gist 同步
+        void flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
       } else if (document.visibilityState === 'visible' && hiddenStartedAtRef.current !== null) {
         const bgMs = Math.max(0, Math.round(performance.now() - hiddenStartedAtRef.current));
         hiddenStartedAtRef.current = null;
@@ -117,12 +141,25 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
     };
   }, [sentenceIndex]);
 
   const handleTokenClick = async (token: SentenceToken) => {
     setActiveToken(token);
     setActiveWordIndex(token.word_index);
+
+    // 借鉴 v0.1.0：点字头顶拼音气泡与同词暖黄高亮在 1.5 秒后自动消隐
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setActiveWordIndex(null);
+      setActiveToken(null);
+      highlightTimerRef.current = null;
+    }, 1500);
 
     const clickedIso = new Date().toISOString();
     charEventsRef.current.push({
@@ -134,6 +171,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       clicked_at: clickedIso
     });
 
+    // 借鉴 v0.1.0：无独立单字音频时优先以整词/单字发声兜底
     await audioPlayer.playUrlOrFallback(token.audio_url, token.character);
   };
 
@@ -169,17 +207,50 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       visitedIndicesRef.current.add(nextIdx);
       setSentenceIndex(nextIdx);
     } else {
-      await flushCurrentSentenceView(sentenceIndex, 'completed', 'finished');
-      onExit();
+      await flushCurrentSentenceView(sentenceIndex, 'completed', 'finished', true);
+      setIsFinishedCelebration(true);
     }
   };
 
   const handleUserExit = async () => {
-    await flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit');
+    await flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
     onExit();
   };
 
   if (!currentSentence) return null;
+
+  // 借鉴 v0.1.0：读完最后一页展示撒花庆祝过渡面板
+  if (isFinishedCelebration) {
+    return (
+      <div
+        class="reader-stage"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          minHeight: '65vh',
+          gap: '20px',
+          textAlign: 'center',
+          padding: '32px 16px'
+        }}
+      >
+        <div style={{ fontSize: '64px', lineHeight: 1 }}>🎉</div>
+        <h1 style={{ fontSize: '28px', margin: '8px 0' }}>读完《{story.title}》啦！</h1>
+        <p style={{ color: '#7a6a5a', fontSize: '16px', margin: 0 }}>
+          今日阅读记录与最新 10 分钟科学配比已自动同步！
+        </p>
+        <button
+          type="button"
+          class="btn-nav btn-primary"
+          onClick={onExit}
+          style={{ minWidth: '180px', minHeight: '54px', fontSize: '20px', marginTop: '12px' }}
+        >
+          再选一本
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div class="reader-stage">
@@ -196,7 +267,12 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
         </div>
       </header>
 
-      <div class="reader-illustration-card">
+      <div
+        class="reader-illustration-card"
+        onClick={() => currentSentence.image_url && setIsImageFullscreen(true)}
+        style={{ cursor: currentSentence.image_url ? 'zoom-in' : 'default' }}
+        title={currentSentence.image_url ? '点击全屏查看插图' : ''}
+      >
         {currentSentence.image_url ? (
           <img src={currentSentence.image_url} alt={story.title} class="story-image" />
         ) : (
@@ -206,6 +282,36 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
           </div>
         )}
       </div>
+
+      {isImageFullscreen && currentSentence.image_url && (
+        <div
+          class="reader-image-fullscreen-overlay"
+          onClick={() => setIsImageFullscreen(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9999,
+            backgroundColor: 'rgba(0, 0, 0, 0.92)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+            cursor: 'zoom-out'
+          }}
+        >
+          <img
+            src={currentSentence.image_url}
+            alt={story.title}
+            style={{
+              maxWidth: '100%',
+              maxHeight: '100%',
+              objectFit: 'contain',
+              borderRadius: '12px',
+              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)'
+            }}
+          />
+        </div>
+      )}
 
       <SentenceDisplay
         tokens={currentSentence.tokens}
