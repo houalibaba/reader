@@ -1,7 +1,10 @@
 # Dependencies & Build
 web/node_modules/
 web/dist/
+server/internal/web/dist/
 server/bin/
+server/internal/updater/runtime_payload_gen.go
+dist/
 *.exe
 
 # Python

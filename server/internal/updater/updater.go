@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,32 +16,50 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"reader/server/internal/config"
 )
 
-// CurrentVersion is overridden at build time via -ldflags "-X reader/server/internal/updater.CurrentVersion=vX.Y.Z".
-var CurrentVersion = "v0.3.8"
+// CurrentVersion is overridden at build time via -ldflags.
+var CurrentVersion = "v0.3.11"
+
+var localHealthClient = &http.Client{
+	Timeout:   2 * time.Second,
+	Transport: &http.Transport{Proxy: nil},
+}
+
+const (
+	runtimeAssetName                     = "reader-runtime.tar.gz"
+	RuntimeActivationRollbackGracePeriod = 30 * time.Second
+	maxRuntimeRollbackGracePeriod        = 5 * time.Minute
+)
 
 type CheckResult struct {
-	CurrentVersion string `json:"current_version"`
-	LatestVersion  string `json:"latest_version"`
-	HasUpdate      bool   `json:"has_update"`
-	Arch           string `json:"arch"`
-	Repo           string `json:"repo"`
-	ReleaseURL     string `json:"release_url"`
-	AssetName      string `json:"asset_name"`
-	AssetURL       string `json:"asset_url"`
-	AssetSize      int64  `json:"asset_size"`
-	ChecksumURL    string `json:"checksum_url,omitempty"`
-	PublishedAt    string `json:"published_at"`
-	ReleaseNotes   string `json:"release_notes"`
+	CurrentVersion   string `json:"current_version"`
+	LatestVersion    string `json:"latest_version"`
+	HasUpdate        bool   `json:"has_update"`
+	Arch             string `json:"arch"`
+	Repo             string `json:"repo"`
+	ReleaseURL       string `json:"release_url"`
+	AssetName        string `json:"asset_name"`
+	AssetURL         string `json:"asset_url"`
+	AssetSize        int64  `json:"asset_size"`
+	RuntimeAssetName string `json:"runtime_asset_name"`
+	RuntimeAssetURL  string `json:"runtime_asset_url"`
+	RuntimeAssetSize int64  `json:"runtime_asset_size"`
+	ChecksumURL      string `json:"checksum_url,omitempty"`
+	PublishedAt      string `json:"published_at"`
+	ReleaseNotes     string `json:"release_notes"`
 }
 
 type ApplyResult struct {
 	Status          string `json:"status"`
 	ExePath         string `json:"-"`
+	RuntimeRoot     string `json:"-"`
 	PreviousVersion string `json:"previous_version"`
 	NewVersion      string `json:"new_version"`
 	Message         string `json:"message"`
@@ -60,10 +79,11 @@ type githubRelease struct {
 }
 
 type Updater struct {
-	cfg           *config.Config
-	httpClient    *http.Client
-	apiBaseURL    string
-	SkipSelfTest  bool
+	cfg          *config.Config
+	httpClient   *http.Client
+	apiBaseURL   string
+	SkipSelfTest bool
+	applyMu      sync.Mutex
 }
 
 func New(cfg *config.Config) *Updater {
@@ -188,38 +208,44 @@ func (u *Updater) CheckUpdate(ctx context.Context, mirrorOverride string) (*Chec
 
 	mirror := u.effectiveMirror(mirrorOverride)
 	wantAsset := ExpectedAssetName()
-	var assetURL string
-	var assetSize int64
-	var checksumURL string
-
+	var assetURL, runtimeURL, checksumURL string
+	var assetSize, runtimeSize int64
 	for _, a := range rel.Assets {
 		switch a.Name {
 		case wantAsset:
 			assetURL = applyMirror(a.BrowserDownloadURL, mirror)
 			assetSize = a.Size
+		case runtimeAssetName:
+			runtimeURL = applyMirror(a.BrowserDownloadURL, mirror)
+			runtimeSize = a.Size
 		case "checksums.txt":
 			checksumURL = applyMirror(a.BrowserDownloadURL, mirror)
 		}
 	}
 
-	hasUpdate := CompareVersions(CurrentVersion, rel.TagName)
 	return &CheckResult{
-		CurrentVersion: CurrentVersion,
-		LatestVersion:  rel.TagName,
-		HasUpdate:      hasUpdate,
-		Arch:           runtime.GOOS + "/" + runtime.GOARCH,
-		Repo:           repo,
-		ReleaseURL:     rel.HTMLURL,
-		AssetName:      wantAsset,
-		AssetURL:       assetURL,
-		AssetSize:      assetSize,
-		ChecksumURL:    checksumURL,
-		PublishedAt:    rel.PublishedAt,
-		ReleaseNotes:   rel.Body,
+		CurrentVersion:   CurrentVersion,
+		LatestVersion:    rel.TagName,
+		HasUpdate:        CompareVersions(CurrentVersion, rel.TagName),
+		Arch:             runtime.GOOS + "/" + runtime.GOARCH,
+		Repo:             repo,
+		ReleaseURL:       rel.HTMLURL,
+		AssetName:        wantAsset,
+		AssetURL:         assetURL,
+		AssetSize:        assetSize,
+		RuntimeAssetName: runtimeAssetName,
+		RuntimeAssetURL:  runtimeURL,
+		RuntimeAssetSize: runtimeSize,
+		ChecksumURL:      checksumURL,
+		PublishedAt:      rel.PublishedAt,
+		ReleaseNotes:     rel.Body,
 	}, nil
 }
 
 func (u *Updater) ApplyUpdate(ctx context.Context, mirrorOverride string) (*ApplyResult, error) {
+	u.applyMu.Lock()
+	defer u.applyMu.Unlock()
+
 	check, err := u.CheckUpdate(ctx, mirrorOverride)
 	if err != nil {
 		return nil, err
@@ -235,46 +261,66 @@ func (u *Updater) ApplyUpdate(ctx context.Context, mirrorOverride string) (*Appl
 	if check.AssetURL == "" {
 		return nil, fmt.Errorf("最新版本 %s 中未找到适配当前架构 (%s) 的编译产物 %s", check.LatestVersion, check.Arch, check.AssetName)
 	}
-
-	tmpDir := os.TempDir()
-	if u.cfg != nil && u.cfg.TmpDir() != "" {
-		tmpDir = u.cfg.TmpDir()
+	if check.RuntimeAssetURL == "" {
+		return nil, fmt.Errorf("最新版本 %s 缺少运行时脚本包 %s；为避免只更新二进制，已中止升级", check.LatestVersion, runtimeAssetName)
 	}
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建临时目录失败: %w", err)
+	if check.ChecksumURL == "" {
+		return nil, fmt.Errorf("最新版本 %s 缺少 checksums.txt；已中止升级", check.LatestVersion)
 	}
-
-	tmpBin := filepath.Join(tmpDir, fmt.Sprintf("reader-%s.tmp", check.LatestVersion))
-	defer func() { _ = os.Remove(tmpBin) }()
-
-	actualSHA, written, err := u.downloadFile(ctx, check.AssetURL, tmpBin)
+	if u.cfg == nil {
+		return nil, fmt.Errorf("升级器缺少外接盘配置，拒绝使用系统临时目录")
+	}
+	tmpDir := u.cfg.TmpDir()
+	if err := validateUpdateStorage(u.cfg.DataDir, tmpDir); err != nil {
+		return nil, fmt.Errorf("更新存储校验失败: %w", err)
+	}
+	if err := checkUpdateFreeSpace(u.cfg, check.AssetSize, check.RuntimeAssetSize); err != nil {
+		return nil, err
+	}
+	workDir, err := os.MkdirTemp(tmpDir, "reader-update-")
 	if err != nil {
-		return nil, fmt.Errorf("下载升级包失败: %w", err)
+		return nil, fmt.Errorf("在外接盘创建升级暂存目录失败: %w", err)
 	}
-	if written < 1024*1024 {
-		return nil, fmt.Errorf("下载的升级包体积异常 (%d 字节)，已中止替换", written)
-	}
-	if check.AssetSize > 0 && written != check.AssetSize {
-		return nil, fmt.Errorf("升级包下载不完整 (期望 %d 字节，实际 %d 字节)", check.AssetSize, written)
-	}
+	defer os.RemoveAll(workDir)
 
-	// Gate 1: Verify ELF executable magic header (\x7fELF) so HTML error pages from mirrors are rejected immediately
+	tmpBin := filepath.Join(workDir, check.AssetName)
+	binarySHA, binarySize, err := u.downloadFile(ctx, check.AssetURL, tmpBin, 512<<20)
+	if err != nil {
+		return nil, fmt.Errorf("下载升级二进制失败: %w", err)
+	}
+	if binarySize < 1024*1024 {
+		return nil, fmt.Errorf("下载的升级二进制体积异常 (%d 字节)，已中止替换", binarySize)
+	}
+	if check.AssetSize > 0 && binarySize != check.AssetSize {
+		return nil, fmt.Errorf("升级二进制下载不完整 (期望 %d 字节，实际 %d 字节)", check.AssetSize, binarySize)
+	}
 	if err := verifyELFHeader(tmpBin); err != nil {
 		return nil, fmt.Errorf("升级包二进制格式校验失败（可能镜像返回了错误页面）: %w", err)
 	}
+	if err := u.verifyChecksum(ctx, check.ChecksumURL, check.AssetName, binarySHA); err != nil {
+		return nil, fmt.Errorf("升级二进制 SHA256 校验失败: %w", err)
+	}
 
-	// Gate 2: Verify SHA256 checksum
-	if check.ChecksumURL != "" {
-		if err := u.verifyChecksum(ctx, check.ChecksumURL, check.AssetName, actualSHA); err != nil {
-			return nil, fmt.Errorf("SHA256 校验失败: %w", err)
-		}
+	runtimePath := filepath.Join(workDir, runtimeAssetName)
+	runtimeSHA, runtimeSize, err := u.downloadFile(ctx, check.RuntimeAssetURL, runtimePath, runtimeBundleMaxBytes)
+	if err != nil {
+		return nil, fmt.Errorf("下载运行时脚本包失败: %w", err)
+	}
+	if check.RuntimeAssetSize > 0 && runtimeSize != check.RuntimeAssetSize {
+		return nil, fmt.Errorf("运行时脚本包下载不完整 (期望 %d 字节，实际 %d 字节)", check.RuntimeAssetSize, runtimeSize)
+	}
+	if err := u.verifyChecksum(ctx, check.ChecksumURL, check.RuntimeAssetName, runtimeSHA); err != nil {
+		return nil, fmt.Errorf("运行时脚本包 SHA256 校验失败: %w", err)
+	}
+	runtimeBundle, err := os.ReadFile(runtimePath)
+	if err != nil {
+		return nil, fmt.Errorf("读取已校验运行时脚本包失败: %w", err)
 	}
 
 	if err := os.Chmod(tmpBin, 0o755); err != nil {
 		return nil, fmt.Errorf("设置可执行权限失败: %w", err)
 	}
-
-	// Gate 3: Pre-Flight Subprocess Execution Check (-self-test) BEFORE touching current binary!
+	// Pre-flight self-test runs before changing the current binary or runtime pointer.
 	if !u.SkipSelfTest {
 		if err := u.runPreFlightSelfTest(ctx, tmpBin); err != nil {
 			return nil, fmt.Errorf("新版本启动自检未通过，已中止升级并保持当前服务正常运行: %w", err)
@@ -288,18 +334,62 @@ func (u *Updater) ApplyUpdate(ctx context.Context, mirrorOverride string) (*Appl
 	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
 		exePath = resolved
 	}
+	if err := validateExecutableOnDataDisk(exePath, u.cfg.DataDir); err != nil {
+		return nil, err
+	}
 
+	if err := activateRuntimeBundle(u.cfg.DataDir, tmpDir, check.LatestVersion, runtimeBundle); err != nil {
+		return nil, fmt.Errorf("运行时脚本包校验或外接盘安装失败: %w", err)
+	}
 	if err := replaceBinary(exePath, tmpBin); err != nil {
+		_ = rollbackRuntimeActivation(u.cfg.DataDir)
 		return nil, fmt.Errorf("替换可执行文件失败: %w", err)
 	}
 
 	return &ApplyResult{
 		Status:          "restarting",
 		ExePath:         exePath,
+		RuntimeRoot:     filepath.Join(u.cfg.DataDir, "runtime"),
 		PreviousVersion: CurrentVersion,
 		NewVersion:      check.LatestVersion,
-		Message:         fmt.Sprintf("已通过完整性与启动自检并切换至 %s，守护进程正在重启服务（若启动异常将自动回滚）...", check.LatestVersion),
+		Message:         "二进制与运行时脚本包均已通过完整性校验；服务正在重启，若健康检查失败将自动回滚二进制与脚本版本。",
 	}, nil
+}
+
+func validateExecutableOnDataDisk(exePath, dataDir string) error {
+	rel, err := filepath.Rel(filepath.Clean(dataDir), filepath.Clean(exePath))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("当前 reader 二进制不在外接数据目录内；为避免向路由器闪存写入升级文件，拒绝升级 (%s)", exePath)
+	}
+	binDev, err := deviceID(exePath)
+	if err != nil {
+		return err
+	}
+	dataDev, err := deviceID(dataDir)
+	if err != nil {
+		return err
+	}
+	if binDev != dataDev {
+		return fmt.Errorf("当前二进制与外接数据盘不在同一文件系统，拒绝写入备份或升级文件")
+	}
+	return nil
+}
+
+func checkUpdateFreeSpace(cfg *config.Config, binarySize, runtimeSize int64) error {
+	if cfg == nil || binarySize <= 0 || binarySize > 512<<20 || runtimeSize <= 0 || runtimeSize > runtimeBundleMaxBytes {
+		return fmt.Errorf("GitHub Release 的资产大小无效或超过安全上限，已中止升级")
+	}
+	freeMB, _, err := cfg.CheckFreeDiskMB()
+	if err != nil {
+		return fmt.Errorf("无法读取外接盘剩余空间: %w", err)
+	}
+	assetBytes := uint64(binarySize + runtimeSize + (1 << 20) - 1)
+	assetMB := assetBytes / (1 << 20)
+	neededMB := cfg.MinFreeDiskMB + assetMB
+	if freeMB < neededMB {
+		return fmt.Errorf("外接盘空间不足：更新需要约 %d MB，并须保留至少 %d MB 空闲空间；当前约 %d MB，已中止升级", assetMB, cfg.MinFreeDiskMB, freeMB)
+	}
+	return nil
 }
 
 func verifyELFHeader(binPath string) error {
@@ -321,18 +411,15 @@ func verifyELFHeader(binPath string) error {
 func (u *Updater) runPreFlightSelfTest(ctx context.Context, binPath string) error {
 	testCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-
-	cfgPath := "/mnt/sda1/reader/config.json"
-	if u.cfg != nil && u.cfg.ConfigPath != "" {
-		cfgPath = u.cfg.ConfigPath
-	} else if u.cfg != nil && u.cfg.DataDir != "" {
+	if u.cfg == nil {
+		return fmt.Errorf("缺少配置，无法保证自检临时文件位于外接盘")
+	}
+	cfgPath := u.cfg.ConfigPath
+	if cfgPath == "" {
 		cfgPath = filepath.Join(u.cfg.DataDir, "config.json")
 	}
-
 	cmd := exec.CommandContext(testCtx, binPath, "-self-test", "-config", cfgPath)
-	if u.cfg != nil && u.cfg.TmpDir() != "" {
-		cmd.Env = append(os.Environ(), "TMPDIR="+u.cfg.TmpDir())
-	}
+	cmd.Env = append(os.Environ(), "TMPDIR="+u.cfg.TmpDir())
 	out, err := cmd.CombinedOutput()
 	outStr := strings.TrimSpace(string(out))
 	if err != nil {
@@ -344,12 +431,13 @@ func (u *Updater) runPreFlightSelfTest(ctx context.Context, binPath string) erro
 	return nil
 }
 
-// SpawnRestartAndRollbackWatchdog launches an independent background shell that:
-// 1. Explicitly terminates the current (old) PID so port 8380 is guaranteed to be released;
-// 2. Starts the new binary via /etc/init.d/reader restart AND direct fallback if procd does not launch it;
-// 3. Verifies that /api/v1/health responds with the NEW version string;
-// 4. Automatically rolls back to reader.bak and restarts if the new binary crashes or fails health check!
+// SpawnRestartAndRollbackWatchdog restarts the service, confirms the new
+// version on the configured LAN address, then commits the runtime pointer. If
+// health fails it restores both reader.bak and the prior runtime symlink.
 func (u *Updater) SpawnRestartAndRollbackWatchdog(exePath, expectedVersion string) {
+	if u.cfg == nil {
+		return
+	}
 	if exePath == "" {
 		if p, err := os.Executable(); err == nil {
 			exePath = p
@@ -359,110 +447,293 @@ func (u *Updater) SpawnRestartAndRollbackWatchdog(exePath, expectedVersion strin
 		}
 	}
 	exePath = strings.TrimSuffix(exePath, ".bak")
-
-	cfgPath := "/mnt/sda1/reader/config.json"
-	tmpDir := "/tmp"
-	port := "8380"
-	if u.cfg != nil {
-		if u.cfg.ConfigPath != "" {
-			cfgPath = u.cfg.ConfigPath
-		} else if u.cfg.DataDir != "" {
-			cfgPath = filepath.Join(u.cfg.DataDir, "config.json")
-		}
-		if u.cfg.TmpDir() != "" {
-			tmpDir = u.cfg.TmpDir()
-		}
-		if idx := strings.LastIndex(u.cfg.Listen, ":"); idx >= 0 && idx+1 < len(u.cfg.Listen) {
-			port = u.cfg.Listen[idx+1:]
-		}
-	}
-
-	logFile := filepath.Join(tmpDir, "updater_watchdog.log")
-	oldPID := os.Getpid()
-	script := fmt.Sprintf(`
-sleep 1
-echo "[watchdog] stopping old pid %d and restarting %s (target %s)" >> %q
-kill -TERM %d 2>/dev/null || true
-sleep 1
-kill -KILL %d 2>/dev/null || true
-
-if [ -x /etc/init.d/reader ]; then
-    /etc/init.d/reader restart >> %q 2>&1 || /etc/init.d/reader start >> %q 2>&1
-fi
-
-sleep 2
-if ! (wget -qO- "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q || curl -fsS "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q); then
-    echo "[watchdog] procd did not bring up new version yet, launching %s directly" >> %q
-    TMPDIR=%q GOMEMLIMIT=120MiB GOGC=50 %q -config %q >> %q 2>&1 &
-fi
-
-OK=0
-for i in 1 2 3 4 5 6; do
-    sleep 1
-    if wget -qO- "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q || curl -fsS "http://127.0.0.1:%s/api/v1/health" 2>/dev/null | grep -q %q; then
-        OK=1
-        echo "[watchdog] verified new version %s is live on port %s" >> %q
-        break
-    fi
-done
-
-if [ "$OK" = "0" ] && [ -f "%s.bak" ]; then
-    echo "[watchdog] new binary failed health check, rolling back to .bak" >> %q
-    killall -9 reader 2>/dev/null || true
-    cp -f "%s.bak" %q
-    chmod +x %q
-    if [ -x /etc/init.d/reader ]; then
-        /etc/init.d/reader restart >> %q 2>&1 || /etc/init.d/reader start >> %q 2>&1
-    fi
-    sleep 1
-    TMPDIR=%q GOMEMLIMIT=120MiB GOGC=50 %q -config %q >> %q 2>&1 &
-fi
-`,
-		oldPID, exePath, expectedVersion, logFile,
-		oldPID, oldPID,
-		logFile, logFile,
-		port, expectedVersion, port, expectedVersion,
-		exePath, logFile,
-		tmpDir, exePath, cfgPath, logFile,
-		port, expectedVersion, port, expectedVersion,
-		expectedVersion, port, logFile,
-		exePath, logFile,
-		exePath, exePath, exePath,
-		logFile, logFile,
-		tmpDir, exePath, cfgPath, logFile,
-	)
-
+	script := buildWatchdogScript(u.cfg, exePath, expectedVersion, os.Getpid())
 	cmd := exec.Command("/bin/sh", "-c", script)
 	_ = cmd.Start()
 }
 
-func (u *Updater) downloadFile(ctx context.Context, url, destPath string) (string, int64, error) {
+func buildWatchdogScript(cfg *config.Config, exePath, expectedVersion string, oldPID int) string {
+	cfgPath := cfg.ConfigPath
+	if cfgPath == "" {
+		cfgPath = filepath.Join(cfg.DataDir, "config.json")
+	}
+	tmpDir := cfg.TmpDir()
+	logFile := filepath.Join(tmpDir, "updater_watchdog.log")
+	runtimeRoot := filepath.Join(cfg.DataDir, "runtime")
+	healthCheckURL := HealthCheckURL(cfg.Listen)
+	q := shellQuote
+	script := fmt.Sprintf(`
+RUNTIME_ROOT=%s
+rollback_runtime() {
+    if [ -L "$RUNTIME_ROOT/current.previous" ]; then
+        mv -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current"
+    elif [ -f "$RUNTIME_ROOT/current.previous-none" ]; then
+        rm -f "$RUNTIME_ROOT/current" "$RUNTIME_ROOT/current.previous-none"
+    fi
+}
+commit_runtime() {
+    rm -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current.previous-none"
+}
+sleep 1
+echo "[watchdog] stopping old pid %d and restarting %s (target %s)" >> %s
+kill -TERM %d 2>/dev/null || true
+sleep 1
+kill -KILL %d 2>/dev/null || true
+if [ -x /etc/init.d/reader ]; then
+    /etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
+fi
+sleep 2
+if ! (wget -qO- %s 2>/dev/null | grep -q %s || curl -fsS %s 2>/dev/null | grep -q %s); then
+    echo "[watchdog] procd did not bring up new version yet, launching directly" >> %s
+    TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
+fi
+OK=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if wget -qO- %s 2>/dev/null | grep -q %s || curl -fsS %s 2>/dev/null | grep -q %s; then
+        OK=1
+        echo "[watchdog] verified new version %s is live" >> %s
+        commit_runtime
+        break
+    fi
+done
+if [ "$OK" = "0" ] && [ -f %s.bak ]; then
+    echo "[watchdog] new version failed health check, rolling back binary and runtime" >> %s
+    killall -9 reader 2>/dev/null || true
+    rollback_runtime
+    cp -f %s.bak %s
+    chmod +x %s
+    if [ -x /etc/init.d/reader ]; then
+        /etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
+    fi
+    sleep 1
+    TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
+fi
+`,
+		q(runtimeRoot), oldPID, exePath, expectedVersion, q(logFile),
+		oldPID, oldPID, q(logFile), q(logFile),
+		q(healthCheckURL), q(expectedVersion), q(healthCheckURL), q(expectedVersion), q(logFile),
+		q(tmpDir), q(exePath), q(cfgPath), q(logFile),
+		q(healthCheckURL), q(expectedVersion), q(healthCheckURL), q(expectedVersion), expectedVersion, q(logFile),
+		q(exePath), q(logFile), q(exePath), q(exePath), q(exePath),
+		q(logFile), q(logFile), q(tmpDir), q(exePath), q(cfgPath), q(logFile),
+	)
+	return script
+}
+
+func healthHostPort(listen string) (string, string) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		if idx := strings.LastIndex(listen, ":"); idx >= 0 {
+			port = listen[idx+1:]
+		}
+		host = ""
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	if port == "" {
+		port = "8380"
+	}
+	return host, port
+}
+
+func healthURL(host, port string) string {
+	return "http://" + net.JoinHostPort(host, port) + "/api/v1/health"
+}
+
+// HealthCheckURL returns a local health URL that also works when the server
+// listens on a specific LAN address rather than 0.0.0.0.
+func HealthCheckURL(listen string) string {
+	host, port := healthHostPort(listen)
+	return healthURL(host, port)
+}
+
+// MarkRuntimeRollbackWatchdogProcess must be called in the watchdog CLI mode
+// before starting goroutines. The old updater uses killall -9 reader; keeping
+// this thread group leader named reader-rollback lets the watchdog survive it.
+func MarkRuntimeRollbackWatchdogProcess() error {
+	runtime.LockOSThread()
+	name := []byte("reader-rollback\x00")
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, syscall.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0, 0)
+	runtime.KeepAlive(name)
+	if errno != 0 {
+		runtime.UnlockOSThread()
+		return errno
+	}
+	return nil
+}
+
+// SpawnRuntimeActivationWatchdog starts a separate copy of the new binary so
+// its rollback remains available if the v0.3.10 updater restores the executable
+// and the main service exits before health succeeds.
+func SpawnRuntimeActivationWatchdog(cfg *config.Config, grace time.Duration) error {
+	if cfg == nil {
+		return fmt.Errorf("missing config for runtime rollback watchdog")
+	}
+	if !RuntimeActivationPending(cfg.DataDir) {
+		return nil
+	}
+	if grace <= 0 || grace > maxRuntimeRollbackGracePeriod {
+		return fmt.Errorf("invalid runtime watchdog grace period %s", grace)
+	}
+	failAndRollback := func(cause error) error {
+		if rollbackErr := rollbackRuntimeActivation(cfg.DataDir); rollbackErr != nil {
+			return fmt.Errorf("%v; runtime pointer rollback failed: %w", cause, rollbackErr)
+		}
+		return cause
+	}
+	if err := validateUpdateStorage(cfg.DataDir, cfg.TmpDir()); err != nil {
+		return failAndRollback(fmt.Errorf("runtime watchdog storage validation failed: %w", err))
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return failAndRollback(fmt.Errorf("locate runtime watchdog executable: %w", err))
+	}
+	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
+		exePath = resolved
+	}
+	cfgPath := cfg.ConfigPath
+	if cfgPath == "" {
+		cfgPath = filepath.Join(cfg.DataDir, "config.json")
+	}
+	logPath := filepath.Join(cfg.TmpDir(), "runtime_rollback_watchdog.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return failAndRollback(fmt.Errorf("open external-disk runtime watchdog log: %w", err))
+	}
+	cmd := exec.Command(exePath, "-runtime-rollback-watchdog="+grace.String(), "-config", cfgPath)
+	cmd.Env = setEnvValue(os.Environ(), "TMPDIR", cfg.TmpDir())
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return failAndRollback(fmt.Errorf("start detached runtime rollback watchdog: %w", err))
+	}
+	_ = logFile.Close()
+	if err := cmd.Process.Release(); err != nil {
+		return failAndRollback(fmt.Errorf("release detached runtime rollback watchdog: %w", err))
+	}
+	return nil
+}
+
+// RunRuntimeActivationWatchdog is the child-process mode used during first
+// bootstrap. It commits only a matching healthy version; otherwise it restores
+// the pointer state recorded before installation (including no prior runtime).
+func RunRuntimeActivationWatchdog(dataDir, listen, expectedVersion string, grace time.Duration) error {
+	if grace <= 0 || grace > maxRuntimeRollbackGracePeriod {
+		return fmt.Errorf("invalid runtime watchdog grace period %s", grace)
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if !RuntimeActivationPending(dataDir) {
+			return nil
+		}
+		remaining := time.Until(deadline)
+		if remaining > 500*time.Millisecond {
+			remaining = 500 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+	if !RuntimeActivationPending(dataDir) {
+		return nil
+	}
+	if healthReportsVersion(listen, expectedVersion) {
+		return CommitRuntimeActivation(dataDir)
+	}
+	return rollbackRuntimeActivation(dataDir)
+}
+
+func healthReportsVersion(listen, expectedVersion string) bool {
+	resp, err := localHealthClient.Get(HealthCheckURL(listen))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var health struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&health); err != nil {
+		return false
+	}
+	return health.Status == "ok" && health.Version == expectedVersion
+}
+
+// HealthCheckHasVersion is used by the main process before committing a
+// runtime activation; an old v0.3.10 service answering HTTP 200 is not success.
+func HealthCheckHasVersion(listen, expectedVersion string) bool {
+	return healthReportsVersion(listen, expectedVersion)
+}
+
+func setEnvValue(env []string, key, value string) []string {
+	prefix := key + "="
+	for i := range env {
+		if strings.HasPrefix(env[i], prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+// LoopbackHealthAddress keeps the v0.3.10 watchdog compatible with LAN-only
+// binds: its legacy probe is hard-coded to 127.0.0.1. The returned listener is
+// loopback-only and is needed only when the main listener uses a specific IP.
+func LoopbackHealthAddress(listen string) (string, bool) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil || host == "" || host == "0.0.0.0" || host == "::" {
+		return "", false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return "", false
+	}
+	if port == "" {
+		return "", false
+	}
+	return net.JoinHostPort("127.0.0.1", port), true
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func (u *Updater) downloadFile(ctx context.Context, url, destPath string, maxBytes int64) (string, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", 0, err
 	}
 	req.Header.Set("User-Agent", "Reader-AutoUpdater/1.0")
-
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
 		return "", 0, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return "", 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
-	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
-
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), resp.Body)
-	if err != nil {
-		return "", n, err
+	n, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxBytes+1))
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if copyErr != nil {
+		return "", n, copyErr
+	}
+	if syncErr != nil {
+		return "", n, syncErr
+	}
+	if closeErr != nil {
+		return "", n, closeErr
+	}
+	if n > maxBytes {
+		return "", n, fmt.Errorf("download exceeds size limit (%d bytes)", maxBytes)
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
@@ -473,7 +744,6 @@ func (u *Updater) verifyChecksum(ctx context.Context, checksumURL, assetName, ac
 		return err
 	}
 	req.Header.Set("User-Agent", "Reader-AutoUpdater/1.0")
-
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -482,7 +752,6 @@ func (u *Updater) verifyChecksum(ctx context.Context, checksumURL, assetName, ac
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return err
@@ -503,17 +772,15 @@ func (u *Updater) verifyChecksum(ctx context.Context, checksumURL, assetName, ac
 func replaceBinary(exePath, newBinPath string) error {
 	bakPath := exePath + ".bak"
 	_ = os.Remove(bakPath)
-
-	// Rename running executable to .bak (safe on Linux; running process keeps open inode).
+	// Rename the running executable to .bak; Linux keeps the old process inode open.
 	if err := os.Rename(exePath, bakPath); err != nil {
 		return err
 	}
-
 	if err := os.Rename(newBinPath, exePath); err == nil {
 		return nil
 	}
-
-	// Cross-device fallback: copy into target directory as .new, then rename atomically.
+	// Cross-device fallback stages beside the executable; production checks above
+	// require that both the executable and updater staging directory are external.
 	stagePath := exePath + ".new"
 	if err := copyFile(newBinPath, stagePath, 0o755); err != nil {
 		_ = os.Rename(bakPath, exePath)
@@ -533,13 +800,11 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	defer in.Close()
-
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}

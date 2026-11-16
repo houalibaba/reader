@@ -75,6 +75,15 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${VERSION}"
 
+      - name: Build versioned runtime package and first-upgrade bootstrap
+        run: |
+          mkdir -p dist
+          python3 tools/build_runtime_bundle.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "${GITHUB_SHA}" \
+            --archive dist/reader-runtime.tar.gz \
+            --go-output server/internal/updater/runtime_payload_gen.go
+
       - name: Build web frontend
         run: |
           cd web
@@ -111,7 +120,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd dist
-          sha256sum reader-linux-amd64 reader-linux-arm64 > checksums.txt
+          sha256sum reader-linux-amd64 reader-linux-arm64 reader-runtime.tar.gz > checksums.txt
           cat checksums.txt
 
       - name: Publish GitHub Release
@@ -124,4 +133,5 @@ jobs:
           files: |
             dist/reader-linux-amd64
             dist/reader-linux-arm64
+            dist/reader-runtime.tar.gz
             dist/checksums.txt

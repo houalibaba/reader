@@ -8,6 +8,7 @@
 
 - **硬件与内存约束**：面向 2 GB 内存、无 Swap、BusyBox 的 iStoreOS 环境设计；采用 Go 单体静态二进制（内嵌前端构建产物）+ SQLite 3（WAL 模式，限制最大连接数与页面缓存），并通过 `procd` 设置 `GOMEMLIMIT=120MiB GOGC=50`，常驻内存控制在 `< 30 MB`。
 - **外接硬盘挂载保护**：启动时强制检查 `/mnt/sda1/reader/.reader-disk` 挂载标记文件；未挂载时拒绝启动，并将 `TMPDIR` 与 SQLite `temp_store` 指向外接硬盘 `/mnt/sda1/reader/tmp`，防止误写路由器闪存或内存盘。
+- **完整应用升级包**：GitHub Release 同时提供 amd64/arm64 服务二进制、`reader-runtime.tar.gz` 和统一 `checksums.txt`。前端、Go 服务及 SQL 迁移随静态二进制交付；`tools/*.py`、`reader_menu.sh` 与部署辅助文件随版本化运行时包交付。更新器在外接盘暂存并分别校验 SHA256，预检新二进制后原子切换；健康检查失败时回滚二进制与运行时指针。升级不覆盖 `config.json`、`data/`、`media/` 或 `backups/`。
 - **局域网离线队列（IndexedDB）**：不依赖公网 HTTPS 与 Service Worker，前端使用 `IndexedDB`（`web/src/queue/offlineQueue.ts`）缓存 `sentence_views`、`character_events`、`audio_events`、`visibility_events`，断网重连后自动批量幂等同步。
 - **多音字上下文注音与不可变故事版本**：`tools/story_packager.py` 在内容生产阶段完成分词、变调/轻声及多音字语境校验（如“通行/行走 `xíng`” vs “一行脚印/银行 `háng`”；“看着 `zhe`” vs “着急 `zháo`”），并在入库时校验 `story_versions.checksum` 防止历史行为指向被篡改的文本。
 - **原始行为与派生能力分离**：保留原始点击事件，支持监护人将误触标记为无效（`is_valid = 0`，记录 `invalid_reason`），通过 `vocabulary_view` 视图动态计算 `needs_support`、`insufficient_evidence` 与 `likely_familiar` 状态。
@@ -51,6 +52,7 @@ reader/
 │       ├── pages/GuardianPage.tsx          # 监护人管理端（PIN 保护、导入导出、误触修正、数据清除）
 │       └── queue/offlineQueue.ts           # IndexedDB 离线事件队列与重连批量上报
 ├── tools/
+│   ├── build_runtime_bundle.py             # 生成带清单的运行时发布包及首升迁移资源
 │   ├── story_packager.py                   # 离线内容分词、多音字注音校验与 .zip 故事包生成工具
 │   ├── dev_server.py                       # Python + SQLite 本地开发与自动化测试参考服务端
 │   └── verify_e2e.py                       # 端到端全链路验收测试套件
@@ -64,17 +66,23 @@ reader/
 ## 3. 编译、验证与部署命令
 
 ```bash
-# 1. 运行端到端自动化验证套件（验证挂载保护、多音字注音、点字求助、断点续读、后台时长扣除、幂等去重）
+# 1. 运行完整自动化测试（构建运行时包，验证 Python 端到端与 Go 更新器测试）
+make test
+
+# 或单独生成版本化运行时包（构建二进制时会自动生成）
+make runtime-bundle
+
+# 2. 运行端到端自动化验证套件（仅 Python 侧）
 PYTHONPATH=tools python3 tools/verify_e2e.py
 
-# 2. 生成样例故事离线包《小熊过河》
+# 3. 生成样例故事离线包《小熊过河》
 python3 tools/story_packager.py --output dist/story_xiaoxiong_v1.zip
 
-# 3. 编译前端与 iStoreOS 静态二进制 (ARM64 / AMD64)
+# 4. 编译前端与 iStoreOS 静态二进制 (ARM64 / AMD64)
 make web
 make build-arm64
 make build-amd64
 
-# 4. 一键自动化部署到 iStoreOS (详见 DEPLOY_ISTOREOS.md)
+# 5. 一键自动化部署到 iStoreOS (详见 DEPLOY_ISTOREOS.md)
 ROUTER_IP=192.168.100.1 READER_BASE=/mnt/sda1/reader sh deploy/deploy_to_istoreos.sh
 ```

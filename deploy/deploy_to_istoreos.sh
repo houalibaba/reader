@@ -4,6 +4,10 @@
 
 set -eu
 
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(dirname "$SCRIPT_DIR")
+cd "$REPO_ROOT"
+
 ROUTER_USER="${ROUTER_USER:-root}"
 ROUTER_IP="${ROUTER_IP:-192.168.100.1}"
 READER_BASE="${READER_BASE:-/mnt/sda1/reader}"
@@ -55,7 +59,8 @@ scp deploy/99-reader-hotplug "${ROUTER_USER}@${ROUTER_IP}:/etc/hotplug.d/block/9
 
 echo "==> [Phase 3] Writing config.json, registering procd service, and configuring sysupgrade persistence..."
 ssh "${ROUTER_USER}@${ROUTER_IP}" "
-    cat > '${READER_BASE}/config.json' <<EOF
+    if [ ! -f '${READER_BASE}/config.json' ]; then
+      cat > '${READER_BASE}/config.json' <<EOF
 {
   \"listen\": \"${ROUTER_IP}:${PORT}\",
   \"data_dir\": \"${READER_BASE}\",
@@ -70,6 +75,9 @@ ssh "${ROUTER_USER}@${ROUTER_IP}" "
   \"min_free_disk_mb\": 1024
 }
 EOF
+    else
+      echo 'Existing config.json preserved.'
+    fi
     sed -i 's|^BASE=.*|BASE=${READER_BASE}|g' /etc/init.d/reader
     sed -i 's|/mnt/sda1/reader|${READER_BASE}|g' /etc/hotplug.d/block/99-reader
     chmod +x '${READER_BASE}/reader.new' /etc/init.d/reader /etc/hotplug.d/block/99-reader

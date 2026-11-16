@@ -68,6 +68,8 @@ python3 tools/story_packager.py --output dist/story_xiaoxiong_v1.zip
 
 **编译产物清单**：
 - `dist/reader-linux-arm64`（或 `dist/reader-linux-amd64`）：内嵌前端 SPA 与 SQL 迁移脚本的静态二进制文件。
+- `dist/reader-runtime.tar.gz`：带版本清单与逐文件 SHA256 的运行时包（含 `tools/*.py`、`reader_menu.sh` 与 `deploy/` 部署辅助文件）；同一份内容也嵌入服务二进制，用于旧版更新器完成首次升级后的引导安装。
+- GitHub Release 的 `checksums.txt`：同时校验目标架构二进制与 `reader-runtime.tar.gz`。
 - `dist/story_xiaoxiong_v1.zip`：离线故事包（含 `manifest.json`、SVG 插图与音频资源）。
 - `deploy/config.json`：服务配置文件。
 - `deploy/reader.init`：OpenWrt/iStoreOS `procd` 守护进程脚本。
@@ -108,7 +110,8 @@ ARCH_BIN="dist/reader-linux-arm64" # 若为 x86_64 则改为 dist/reader-linux-a
 
 # 1. 上传二进制与配置文件到外接硬盘
 scp "$ARCH_BIN" "root@${ROUTER_IP}:${READER_BASE}/reader"
-scp deploy/config.json "root@${ROUTER_IP}:${READER_BASE}/config.json"
+# 仅首次部署时上传默认配置；已有安装必须保留现有 config.json。
+# scp deploy/config.json "root@${ROUTER_IP}:${READER_BASE}/config.json"
 scp dist/story_xiaoxiong_v1.zip "root@${ROUTER_IP}:${READER_BASE}/tmp/story_xiaoxiong_v1.zip"
 
 # 2. 上传 procd 启动脚本与 hotplug 挂载自启脚本
@@ -138,6 +141,12 @@ grep -qxF '/etc/hotplug.d/block/99-reader' /etc/sysupgrade.conf || echo '/etc/ho
 /etc/init.d/reader enable
 /etc/init.d/reader start
 ```
+
+### 5.1 应用内升级资产与安全切换
+
+每个 GitHub Release 必须同时包含 `reader-linux-amd64`、`reader-linux-arm64`、`reader-runtime.tar.gz` 和覆盖三者的 `checksums.txt`。前端、Go 服务与 SQL 迁移编译进静态二进制；`tools/*.py`、`reader_menu.sh` 与 `deploy/` 辅助文件按版本打包，更新后位于 `$READER_BASE/runtime/current/`，版本副本保留在 `runtime/releases/<版本>/`。若根目录的 `tools/` 或 `reader_menu.sh` 尚不存在，系统会创建兼容链接；已有同名用户文件不会被覆盖。部署包只会供后续部署使用，不会在应用内升级时重写 `/etc` 中当前服务脚本或用户配置。
+
+从仅能更新二进制的旧版（包括 v0.3.10）升级时，新二进制内含对应版本的运行时包，会在首次启动时将脚本安装到外接盘，因此不要求旧客户端先理解新资产格式。更新器会要求 `.reader-disk` 标记、确认暂存目录位于数据盘且与二进制同盘；下载与解包只使用 `$READER_BASE/tmp`，不会回退到路由器 `/tmp` 或闪存。二进制需通过 ELF、SHA256 和启动自检；运行时包需通过包内版本清单及逐文件哈希校验。健康检查通过后提交切换，失败则恢复 `.bak` 二进制和先前的运行时版本。更新过程不改写 `config.json`、`data/`、`media/` 或 `backups/`。
 
 ### 附：一键无人值守部署脚本（`deploy/deploy_to_istoreos.sh`）
 

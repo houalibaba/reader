@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -99,16 +100,34 @@ func Load(path string) (*Config, error) {
 // VerifyDiskMount checks that the external drive mount marker exists and ensures subdirectories exist.
 // Prevents writing to router flash memory when external storage is unmounted.
 func (c *Config) VerifyDiskMount() error {
+	dataInfo, err := os.Lstat(c.DataDir)
+	if err != nil {
+		return fmt.Errorf("stat data directory %s: %w", c.DataDir, err)
+	}
+	if !dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("data directory %s must be a real directory, not a symlink", c.DataDir)
+	}
 	marker := filepath.Join(c.DataDir, MountMarkerFile)
-	info, err := os.Stat(marker)
+	info, err := os.Lstat(marker)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("external disk mount marker missing (%s): refusing to start on router flash", marker)
 		}
 		return fmt.Errorf("stat mount marker %s: %w", marker, err)
 	}
-	if info.IsDir() {
-		return errors.New("mount marker .reader-disk must be a file, not a directory")
+	if !info.Mode().IsRegular() {
+		return errors.New("mount marker .reader-disk must be a regular file, not a directory or symlink")
+	}
+	if err := c.verifyExternalDataVolume(); err != nil {
+		return err
+	}
+	tmpInfo, err := os.Lstat(c.TmpDir())
+	if err == nil {
+		if !tmpInfo.IsDir() || tmpInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("temporary directory %s must be a real directory, not a symlink", c.TmpDir())
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat temporary directory %s: %w", c.TmpDir(), err)
 	}
 
 	dirs := []string{
@@ -123,6 +142,30 @@ func (c *Config) VerifyDiskMount() error {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
+	}
+	return nil
+}
+
+func (c *Config) verifyExternalDataVolume() error {
+	dataDir := filepath.Clean(c.DataDir)
+	if !strings.HasPrefix(dataDir, "/mnt/") {
+		return nil
+	}
+	dataInfo, err := os.Stat(dataDir)
+	if err != nil {
+		return fmt.Errorf("stat external data directory %s: %w", dataDir, err)
+	}
+	rootInfo, err := os.Stat("/")
+	if err != nil {
+		return fmt.Errorf("stat root filesystem: %w", err)
+	}
+	dataStat, dataOK := dataInfo.Sys().(*syscall.Stat_t)
+	rootStat, rootOK := rootInfo.Sys().(*syscall.Stat_t)
+	if !dataOK || !rootOK {
+		return errors.New("cannot verify external data filesystem")
+	}
+	if dataStat.Dev == rootStat.Dev {
+		return fmt.Errorf("%s is not on a mounted external filesystem: refusing to start on router flash", dataDir)
 	}
 	return nil
 }
