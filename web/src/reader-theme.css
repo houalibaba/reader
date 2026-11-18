@@ -1,182 +1,287 @@
 /* ==========================================================================
-   reader-theme.css — 儿童平板触控点读轻量级原生 CSS 视觉规范
-   兼容现有 ReaderPage / SentenceDisplay 类名与新一代语义卡片结构
+   reader-theme.css — 儿童点读沉浸式毛玻璃与一屏按词换行规范 (Modern Web Guidance)
+   1. 底层当前插图高斯模糊铺满 + 上层文字区域毛玻璃效果
+   2. 插图高度收敛至约 1/4 屏，整句话一屏读完、按词语换行
+   3. 复习字/新字彩色胶囊标记，默认隐藏拼音，点一下再出拼音
    ========================================================================== */
 
 :root {
-  /* 表面与卡片层次（暖纸张护眼配色） */
   --bg-canvas: #faf8f5;
   --bg-card: #ffffff;
-  --bg-surface-subtle: #f2efe9;
-  --border-subtle: rgba(30, 36, 43, 0.08);
+  --bg-surface-subtle: #f3f1ec;
+  --border-subtle: rgba(30, 36, 43, 0.09);
 
-  /* 文字高对比层级 */
-  --text-primary: #1e242b;
-  --text-pinyin: #646e7a;
-  --text-muted: #8c96a3;
+  --text-primary: #14181f;
+  --text-pinyin: #5a6270;
+  --text-muted: #86909c;
 
-  /* 语义状态色（点读高亮与艾宾浩斯复习） */
-  --accent-speak-bg: #fff3d6;
-  --accent-speak-ring: #ff9f1c;
-  --accent-word-bg: #ffe9a8;
-  --accent-review-dot: #2ec4b6;
-  --accent-primary: #3a86ff;
-  --accent-audio: #ff8c42;
+  /* 复习字与新字柔和标记色（参照设计图浅粉红底 + 深红拼音） */
+  --review-bg: #f8d8da;
+  --review-text: #8c2d38;
+  --newchar-bg: #d4f0db;
+  --newchar-text: #1e6b38;
 
-  /* 流体字号与粗笔画清晰字体 */
+  --accent-speak-bg: #fff0c2;
+  --accent-speak-ring: #f59e0b;
+  --accent-word-bg: rgba(255, 232, 163, 0.55);
+  --accent-primary: #2563eb;
+
   --font-hanzi: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
-  --font-pinyin: system-ui, -apple-system, sans-serif;
-  --size-hanzi: clamp(2.25rem, 4.5vw, 3.5rem);
-  --size-pinyin: clamp(0.875rem, 1.5vw, 1.125rem);
+  --font-pinyin: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --size-hanzi: clamp(1.9rem, 6.2vw, 2.85rem);
+  --size-pinyin: clamp(0.86rem, 2.8vw, 1.08rem);
 
-  /* 留白与圆角 */
-  --space-outer: clamp(12px, 2.5vw, 28px);
-  --space-card-pad: clamp(16px, 3vw, 32px);
-  --radius-card: 24px;
-  --radius-char: 14px;
+  --radius-card: 22px;
+  --radius-char: 12px;
   --radius-pill: 9999px;
 
-  /* 柔和物理阴影 */
-  --shadow-card: 0 8px 28px -6px rgba(30, 36, 43, 0.07),
-                 0 2px 6px -1px rgba(30, 36, 43, 0.04);
+  --shadow-card: 0 10px 30px -8px rgba(20, 24, 31, 0.08),
+                 0 2px 6px -1px rgba(20, 24, 31, 0.04);
 
-  /* 弹簧与顺滑过渡曲线 */
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --ease-smooth: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* ==========================================================================
-   全局触控保护
-   ========================================================================== */
 *, *::before, *::after {
   box-sizing: border-box;
   -webkit-tap-highlight-color: transparent;
 }
 
-body {
+html, body {
+  width: 100%;
+  max-width: 100vw;
+  min-height: 100dvh;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   font-family: var(--font-hanzi);
 }
 
 /* ==========================================================================
-   儿童阅读主舞台（锁屏一页一句，消除滚动与误触）
+   沉浸式阅读外层容器：底层当前插图模糊铺满 + 柔和遮罩
+   ========================================================================== */
+.reader-stage-immersive {
+  position: relative;
+  width: 100%;
+  height: 100dvh;
+  overflow: hidden;
+  background-color: var(--bg-canvas);
+  isolation: isolate;
+}
+
+.reader-ambient-bg {
+  position: absolute;
+  inset: -32px;
+  z-index: -2;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  filter: blur(42px) saturate(1.25) brightness(1.04);
+  transform: scale(1.12);
+  opacity: 0.58;
+  transition: background-image 0.45s ease;
+  pointer-events: none;
+}
+
+.reader-ambient-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(
+    180deg,
+    rgba(250, 248, 245, 0.72) 0%,
+    rgba(250, 248, 245, 0.52) 45%,
+    rgba(250, 248, 245, 0.78) 100%
+  );
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   儿童阅读主舞台（一屏内完整呈现，不出现多余纵向滚动）
    ========================================================================== */
 .reader-stage {
   display: grid;
-  grid-template-rows: auto 1fr auto auto;
+  grid-template-rows: auto minmax(115px, 24dvh) 1fr auto;
   height: 100dvh;
-  max-width: 1120px;
+  width: 100%;
+  max-width: 680px;
   margin: 0 auto;
-  padding: var(--space-outer);
-  gap: clamp(10px, 1.8vh, 18px);
+  padding: clamp(10px, 2.2vh, 18px) clamp(14px, 3.5vw, 24px);
+  padding-bottom: calc(clamp(12px, 2.4vh, 20px) + env(safe-area-inset-bottom, 0px));
+  gap: clamp(10px, 1.8vh, 16px);
   overflow: hidden;
   touch-action: manipulation;
   user-select: none;
   -webkit-user-select: none;
-  -webkit-touch-callout: none;
 }
 
-.reader-topbar,
-.reader-header {
-  display: flex;
+/* 顶部极简导航条：← + 进度条 + 1/20 + ⚙ */
+.reader-topbar-minimal {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  padding: 4px 6px;
+  padding: 4px 2px;
+  min-width: 0;
 }
 
-.reader-title-group {
-  display: flex;
+.reader-icon-btn {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-}
-
-.reader-title-group h2 {
-  margin: 0;
-  font-size: clamp(1.05rem, 2vw, 1.35rem);
-  font-weight: 700;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid rgba(20, 24, 31, 0.08);
+  background: rgba(255, 255, 255, 0.75);
   color: var(--text-primary);
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.15s ease, background-color 0.15s ease;
 }
 
-.badge-mode,
-.reader-progress {
-  padding: 6px 14px;
+.reader-icon-btn:active {
+  transform: scale(0.92);
+}
+
+.reader-progress-track {
+  width: 100%;
+  height: 8px;
+  background: rgba(20, 24, 31, 0.08);
   border-radius: var(--radius-pill);
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  font-size: 0.9rem;
+  overflow: hidden;
+}
+
+.reader-progress-fill {
+  height: 100%;
+  background: var(--accent-primary);
+  border-radius: var(--radius-pill);
+  transition: width 0.3s var(--ease-smooth);
+}
+
+.reader-page-counter {
+  font-size: 0.98rem;
   font-weight: 600;
   color: var(--text-pinyin);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* ==========================================================================
-   核心绘本插画卡片（支持新page进入平滑过渡）
+   紧凑插图区（高度约占屏幕 1/4）
    ========================================================================== */
-.reader-illustration-card,
-.story-card {
-  container-type: size;
+.reader-illustration-compact,
+.reader-illustration-card {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 0;
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-card);
+  width: 100%;
+  height: 100%;
+  min-height: 110px;
+  max-height: 25dvh;
+  background: rgba(255, 255, 255, 0.66);
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 18px;
   box-shadow: var(--shadow-card);
-  padding: clamp(12px, 2vw, 22px);
+  padding: 6px;
   overflow: hidden;
-  transition: transform 0.35s var(--ease-smooth), opacity 0.3s var(--ease-smooth);
+  transition: transform 0.3s var(--ease-smooth), opacity 0.25s var(--ease-smooth);
 }
 
-@starting-style {
-  .reader-illustration-card,
-  .story-card {
-    opacity: 0;
-    transform: translateY(8px) scale(0.988);
+@supports (backdrop-filter: blur(16px)) or (-webkit-backdrop-filter: blur(16px)) {
+  .reader-illustration-compact,
+  .reader-illustration-card {
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
   }
 }
 
-.reader-illustration-card img.story-image,
-.illustration-box img {
+@starting-style {
+  .reader-illustration-compact {
+    opacity: 0;
+    transform: translateY(4px) scale(0.99);
+  }
+}
+
+.reader-illustration-compact img.story-image,
+.reader-illustration-card img.story-image {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  border-radius: calc(var(--radius-card) - 8px);
+  border-radius: 13px;
   display: block;
 }
 
 .story-image-placeholder {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
   width: 100%;
   height: 100%;
-  background: var(--bg-surface-subtle);
-  border-radius: calc(var(--radius-card) - 8px);
-  color: var(--text-pinyin);
-  font-size: 1.05rem;
+  background: #cdeccd;
+  color: #1c6b2a;
+  border-radius: 13px;
+  font-size: 0.98rem;
+  font-weight: 600;
+  text-align: center;
+  padding: 12px;
 }
 
 /* ==========================================================================
-   单句点读文字区与大尺寸触控热区（兼容 SentenceDisplay.tsx）
+   毛玻璃文字区 + 按词语换行 (word-group) + 复习字/新字彩色标记
    ========================================================================== */
-.sentence-tokens-wrap,
-.sentence-area {
+.sentence-card-glass {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  padding: clamp(14px, 2.4vh, 26px) clamp(12px, 3vw, 22px) clamp(12px, 2vh, 18px);
+  border-radius: var(--radius-card);
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  box-shadow: 0 12px 32px -10px rgba(20, 24, 31, 0.1);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+@supports (backdrop-filter: blur(22px)) or (-webkit-backdrop-filter: blur(22px)) {
+  .sentence-card-glass {
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(22px) saturate(1.35);
+    -webkit-backdrop-filter: blur(22px) saturate(1.35);
+  }
+}
+
+.sentence-tokens-wrap {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-end;
   justify-content: center;
   align-content: center;
-  gap: 10px 12px;
-  padding: clamp(14px, 2.2vh, 24px) 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-card);
-  box-shadow: var(--shadow-card);
+  gap: clamp(6px, 1.4vh, 12px) clamp(4px, 1.2vw, 8px);
+  width: 100%;
+  margin: auto 0;
+}
+
+/* 核心：同一个词包在 inline-flex 不折行容器内，保证按词语换行 */
+.word-group {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: flex-end;
+  border-radius: 14px;
+  padding: 1px 2px;
+  max-width: 100%;
+  transition: background-color 0.16s ease;
+}
+
+.word-group-active {
+  background-color: var(--accent-word-bg);
 }
 
 .char-hitbox,
@@ -186,156 +291,332 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: flex-end;
-  min-width: 56px;
-  min-height: 68px;
-  padding: 6px 8px;
+  min-width: clamp(38px, 10.5vw, 56px);
+  min-height: clamp(56px, 13vw, 76px);
+  padding: 2px 3px 4px;
+  margin: 0;
   border-radius: var(--radius-char);
+  border: none;
   background: transparent;
-  border: 2px solid transparent;
-  font-family: var(--font-hanzi);
   cursor: pointer;
-  transition: transform 0.22s var(--ease-spring),
-              background-color 0.18s ease,
-              border-color 0.18s ease;
+  user-select: none;
+  transition: transform 0.15s var(--ease-spring), background-color 0.15s ease;
 }
 
-.char-punct,
-.char-token[data-punct="true"] {
-  min-width: 26px;
-  padding: 6px 2px;
-  margin-left: -6px;
-  pointer-events: none;
-}
-
-.char-pinyin {
-  font-family: var(--font-pinyin);
-  font-size: var(--size-pinyin);
-  font-weight: 600;
-  line-height: 1.2;
-  color: var(--text-pinyin);
-  margin-bottom: 4px;
-  letter-spacing: 0.02em;
-}
-
-.char-glyph,
-.char-hanzi {
-  font-size: var(--size-hanzi);
-  font-weight: 600;
-  line-height: 1.15;
-  color: var(--text-primary);
-}
-
-/* 按下回弹反馈 */
-.char-hitbox:not(:disabled):active,
-.char-token:active {
-  transform: scale(0.91);
-  background-color: var(--bg-surface-subtle);
-}
-
-/* 所属词语暖黄高亮 */
-.char-hitbox.word-highlighted {
-  background-color: var(--accent-word-bg) !important;
-  border-radius: var(--radius-char) !important;
-}
-
-/* 正在点读单字高亮 + GPU 光晕波纹 */
-.char-hitbox.char-selected,
-.char-token.is-speaking {
-  background-color: var(--accent-speak-bg) !important;
-  border-color: var(--accent-speak-ring);
-  transform: translateY(-3px) scale(1.06);
-}
-
-.char-hitbox.char-selected::after,
-.char-token.is-speaking::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: calc(var(--radius-char) + 4px);
-  border: 2px solid var(--accent-speak-ring);
-  opacity: 0;
-  pointer-events: none;
-  animation: speak-ripple 0.65s var(--ease-smooth) forwards;
-}
-
-@keyframes speak-ripple {
-  0% {
-    opacity: 0.75;
-    transform: scale(0.96);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.14);
-  }
-}
-
-/* 点字求助提示横幅 */
-.help-feedback-banner {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 20px;
-  padding: 10px 20px;
-  border-radius: var(--radius-pill);
-  background: var(--accent-speak-bg);
-  border: 1.5px solid rgba(255, 159, 28, 0.35);
-  font-size: 1rem;
-  color: var(--text-primary);
-}
-
-/* ==========================================================================
-   底部大拇指友好控制栏（兼容 ReaderPage.tsx 按钮类名）
-   ========================================================================== */
-.reader-controls {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.reader-controls .btn-nav,
-.reader-controls .btn-audio,
-.btn-touch {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-width: 112px;
-  min-height: 60px;
-  padding: 0 26px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  font-family: var(--font-hanzi);
-  font-size: 1.15rem;
-  font-weight: 600;
-  background: var(--bg-card);
-  color: var(--text-primary);
-  box-shadow: 0 3px 12px rgba(30, 36, 43, 0.06);
-  cursor: pointer;
-  transition: transform 0.2s var(--ease-spring), background-color 0.15s ease;
-}
-
-.reader-controls .btn-nav:active,
-.reader-controls .btn-audio:active,
-.btn-touch:active {
+.char-interactive:active {
   transform: scale(0.93);
 }
 
-.reader-controls .btn-audio {
-  background: #fff6eb;
-  border-color: rgba(255, 140, 66, 0.35);
-  color: #b84a08;
+.char-punct {
+  min-width: clamp(18px, 4.5vw, 28px);
+  padding: 2px 1px 4px;
+  cursor: default;
 }
 
-.reader-controls .btn-primary,
-.btn-touch.is-primary {
-  background: var(--accent-primary);
-  border-color: transparent;
-  color: #ffffff;
+/* 汉字本体与复习字/新字胶囊背景 */
+.char-glyph,
+.char-hanzi {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-hanzi);
+  font-size: var(--size-hanzi);
+  line-height: 1.15;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 2px 5px;
+  border-radius: 10px;
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.reader-controls button:disabled,
-.btn-touch:disabled {
-  opacity: 0.35;
+/* 复习字：浅红圆角底色 */
+.char-role-review .char-hanzi {
+  background-color: var(--review-bg);
+  color: #18181b;
+}
+
+/* 本篇新字：浅绿圆角底色 */
+.char-role-new .char-hanzi {
+  background-color: var(--newchar-bg);
+  color: #14532d;
+}
+
+/* 点读选中状态 */
+.char-selected .char-hanzi {
+  box-shadow: 0 0 0 2.5px var(--accent-speak-ring);
+}
+
+/* 拼音行：始终保留占位防抖动，默认隐藏，点一下才显示 */
+.char-pinyin {
+  font-family: var(--font-pinyin);
+  font-size: var(--size-pinyin);
+  line-height: 1.2;
+  min-height: 1.25em;
+  font-weight: 600;
+  margin-bottom: 3px;
+  padding: 0 4px;
+  border-radius: 6px;
+  white-space: nowrap;
   pointer-events: none;
+  color: var(--review-text);
+  transition: opacity 0.16s ease, transform 0.16s var(--ease-spring);
+}
+
+.char-role-new .char-pinyin {
+  color: var(--newchar-text);
+}
+
+.char-pinyin.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.char-pinyin.is-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* 句末图例胶囊：复习字 | 其余字点一下才出拼音 */
+.sentence-legend-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 4px;
+}
+
+.legend-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  font-size: clamp(0.78rem, 2.3vw, 0.88rem);
+  font-weight: 600;
+}
+
+.legend-pill-review {
+  background-color: var(--review-bg);
+  color: var(--review-text);
+}
+
+.legend-pill-new {
+  background-color: var(--newchar-bg);
+  color: var(--newchar-text);
+}
+
+.legend-pill-hint {
+  background-color: rgba(20, 24, 31, 0.06);
+  color: var(--text-pinyin);
+  font-weight: 500;
+}
+
+/* ==========================================================================
+   底部翻页与圆形语音朗读栏（严格对齐设计图）
+   ========================================================================== */
+.reader-controls-modern {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+}
+
+.btn-page-prev,
+.btn-page-next {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  padding: 12px 18px;
+  border-radius: 16px;
+  font-family: var(--font-hanzi);
+  font-size: clamp(0.98rem, 3vw, 1.12rem);
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s ease, opacity 0.15s ease, background-color 0.15s ease;
+}
+
+.btn-page-prev {
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--text-primary);
+  border: 1px solid rgba(20, 24, 31, 0.12);
+}
+
+.btn-page-prev:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn-page-next {
+  background: #0f1419;
+  color: #ffffff;
+  border: 1px solid #0f1419;
+}
+
+.btn-page-prev:not(:disabled):active,
+.btn-page-next:active {
+  transform: scale(0.97);
+}
+
+.btn-audio-circle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text-primary);
+  border: 1px solid rgba(20, 24, 31, 0.12);
+  box-shadow: 0 4px 14px rgba(20, 24, 31, 0.06);
+  cursor: pointer;
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.btn-audio-circle.is-playing {
+  background: var(--accent-speak-bg);
+  border-color: var(--accent-speak-ring);
+}
+
+.btn-audio-circle:active {
+  transform: scale(0.92);
+}
+
+/* ==========================================================================
+   原生 <dialog> 全屏插图与阅读设置弹窗
+   ========================================================================== */
+.fullscreen-image-dialog,
+.reader-settings-dialog {
+  border: none;
+  border-radius: 20px;
+  padding: 0;
+  max-width: min(94vw, 520px);
+  max-height: 90dvh;
+  background: transparent;
+}
+
+.fullscreen-image-dialog::backdrop,
+.reader-settings-dialog::backdrop {
+  background: rgba(15, 20, 25, 0.72);
+  backdrop-filter: blur(4px);
+}
+
+.dialog-image-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+
+.dialog-fullscreen-img {
+  max-width: 90vw;
+  max-height: 80dvh;
+  object-fit: contain;
+  border-radius: 16px;
+}
+
+.dialog-close-hint {
+  color: #ffffff;
+  font-size: 0.92rem;
+  background: rgba(0, 0, 0, 0.58);
+  padding: 6px 16px;
+  border-radius: var(--radius-pill);
+}
+
+.reader-settings-sheet {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  padding: 20px;
+  border-radius: 20px;
+  min-width: min(88vw, 340px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.22);
+}
+
+.settings-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-sheet-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: var(--bg-surface-subtle);
+  border-radius: 12px;
+  font-size: 0.95rem;
+}
+
+.settings-sheet-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings-sheet-actions button {
+  width: 100%;
+}
+
+/* 读完庆祝弹窗 */
+.celebration-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(20, 24, 30, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.celebration-card {
+  background: var(--bg-card);
+  border-radius: 24px;
+  padding: clamp(20px, 5vw, 32px);
+  max-width: 420px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+}
+
+.celebration-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+/* 小屏手机高度紧凑优化 */
+@media (max-height: 700px) {
+  .reader-stage {
+    grid-template-rows: auto minmax(95px, 21dvh) 1fr auto;
+    gap: 8px;
+  }
+
+  :root {
+    --size-hanzi: clamp(1.65rem, 5.6vw, 2.3rem);
+  }
+
+  .char-hitbox,
+  .char-token {
+    min-height: 50px;
+  }
+
+  .btn-page-prev,
+  .btn-page-next {
+    min-height: 46px;
+    padding: 10px 14px;
+  }
+
+  .btn-audio-circle {
+    width: 48px;
+    height: 48px;
+  }
 }

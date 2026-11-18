@@ -3,10 +3,12 @@ import {
   apiClient,
   ChildProfile,
   HealthStatusResponse,
+  PlanTargetItem,
   SentenceToken,
   StoryPlanResponse,
   StorySummary,
-  UpdateCheckResponse
+  UpdateCheckResponse,
+  VocabularyEntry
 } from '../api/client';
 import { audioPlayer } from '../audio/player';
 import { SentenceDisplay } from '../components/SentenceDisplay';
@@ -103,7 +105,7 @@ function buildPreviewTokens(sentence: string, pageIndex: number): SentenceToken[
     return {
       id: `preview_p${pageIndex}_c${idx}`,
       character: ch,
-      pinyin: isPunct ? '' : POLYPHONIC_CHARS.has(ch) ? '多音待校' : '点字听音',
+      pinyin: isPunct ? '' : POLYPHONIC_CHARS.has(ch) ? 'duō yīn' : 'pīn yīn',
       word: ch,
       word_index: wordIndex,
       audio_url: ''
@@ -126,12 +128,19 @@ function fileToBase64(file: File): Promise<string> {
 
 export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianPageProps) {
   const [pin, setPin] = useState<string>(() => sessionStorage.getItem('guardian_pin') || '1234');
-  const [activeTab, setActiveTab] = useState<'prompt' | 'quick' | 'autogen' | 'library' | 'system'>('prompt');
+  // 底部四栏导航：识字计划(plan) | 书架(bookshelf) | 备份(backup) | 升级(upgrade)
+  const [activeTab, setActiveTab] = useState<'plan' | 'bookshelf' | 'backup' | 'upgrade'>('plan');
+  const [showHeaderMenu, setShowHeaderMenu] = useState<boolean>(false);
 
-  // 自适应识字计划与 AI 提示词状态
+  // 自适应识字计划与字库状态
   const [plan, setPlan] = useState<StoryPlanResponse | null>(null);
+  const [vocabList, setVocabList] = useState<VocabularyEntry[]>([]);
   const [loadingPlan, setLoadingPlan] = useState<boolean>(false);
   const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
+  const [showAllReviewChars, setShowAllReviewChars] = useState<boolean>(false);
+
+  // 三步生成新故事展开状态：null | 'step2' | 'step3'
+  const [expandedStep, setExpandedStep] = useState<'step2' | 'step3' | null>(null);
 
   // 一键纯净正文导入与逐句校验状态
   const [title, setTitle] = useState<string>('');
@@ -142,14 +151,13 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
   const [pageImages, setPageImages] = useState<Record<number, PageImageSlot>>({});
   const [pullingGist, setPullingGist] = useState<boolean>(false);
 
-  // 右侧实时阅读器模拟器状态（默认不标拼音，点击才显示）
+  // 实时阅读器模拟器状态（默认不标拼音，点击才显示）
   const [previewPageIndex, setPreviewPageIndex] = useState<number>(0);
-  const [previewOrientation, setPreviewOrientation] = useState<'landscape' | 'portrait'>('landscape');
   const [previewShowPinyin, setPreviewShowPinyin] = useState<boolean>(false);
   const [previewActiveTokenId, setPreviewActiveTokenId] = useState<string | null>(null);
   const previewTimerRef = useRef<number | null>(null);
 
-  // 全自动生成配置
+  // 全自动生成配置（收纳在步骤2高级选项中）
   const [autoTheme, setAutoTheme] = useState<string>(PRESET_THEMES[1]);
   const [llmApiUrl, setLlmApiUrl] = useState<string>('');
   const [llmApiKey, setLlmApiKey] = useState<string>('');
@@ -157,7 +165,7 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
   const [imageApiUrl, setImageApiUrl] = useState<string>('');
   const [imageApiKey, setImageApiKey] = useState<string>('');
   const [imageModel, setImageModel] = useState<string>('');
-  const [showApiConfig, setShowApiConfig] = useState<boolean>(false);
+  const [showAutoGenPanel, setShowAutoGenPanel] = useState<boolean>(false);
 
   // 书架管理与状态提示
   const [stories, setStories] = useState<StorySummary[]>([]);
@@ -174,15 +182,72 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
 
   const batchImgInputRef = useRef<HTMLInputElement | null>(null);
   const zipInputRef = useRef<HTMLInputElement | null>(null);
+  const menuDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const sentences = useMemo(() => splitSentencesClient(rawText), [rawText]);
 
   const reviewCharSet = useMemo(() => {
     const s = new Set<string>();
     plan?.review_targets?.forEach((t) => s.add(t.character));
+    plan?.observe_targets?.forEach((t) => s.add(t.character));
+    return s;
+  }, [plan]);
+
+  const newCharSet = useMemo(() => {
+    const s = new Set<string>();
     plan?.new_candidates?.forEach((t) => s.add(t.character));
     return s;
   }, [plan]);
+
+  // 统计四宫格数字：已掌握字、急需复习、待巩固、本篇新字
+  const masteredCount = useMemo(() => {
+    const fromSummary =
+      plan?.summary?.familiar_count ??
+      plan?.summary?.mastered_count ??
+      plan?.summary?.likely_familiar_count;
+    if (typeof fromSummary === 'number' && fromSummary > 0) {
+      return fromSummary;
+    }
+    const familiarVocab = vocabList.filter((v) => v.estimated_status === 'likely_familiar').length;
+    if (familiarVocab > 0) {
+      return familiarVocab;
+    }
+    return plan?.familiar_anchors?.length || vocabList.length || 0;
+  }, [plan, vocabList]);
+
+  const urgentReviewCount = plan?.review_targets?.length || 0;
+  const observeCount = plan?.observe_targets?.length || 0;
+  const newCandidateCount = plan?.new_candidates?.length || 0;
+
+  // 复习字列表：合并急需复习与待巩固，按保留率从低到高排序
+  const sortedReviewItems = useMemo<Array<PlanTargetItem & { computedPct: number }>>(() => {
+    if (!plan) return [];
+    const seen = new Set<string>();
+    const combined: Array<PlanTargetItem & { computedPct: number }> = [];
+
+    const pushItem = (item: PlanTargetItem, fallbackPct: number) => {
+      if (!item.character || seen.has(item.character)) return;
+      seen.add(item.character);
+      const rawPct = typeof item.retention_pct === 'number' ? item.retention_pct : fallbackPct;
+      const clamped = Math.max(1, Math.min(100, Math.round(rawPct)));
+      combined.push({
+        ...item,
+        computedPct: clamped
+      });
+    };
+
+    (plan.review_targets || []).forEach((item, idx) => pushItem(item, Math.min(35, 8 + idx * 5)));
+    (plan.observe_targets || []).forEach((item, idx) => pushItem(item, Math.min(75, 42 + idx * 6)));
+
+    return combined.sort((a, b) => a.computedPct - b.computedPct);
+  }, [plan]);
+
+  const visibleReviewItems = useMemo(() => {
+    if (showAllReviewChars) return sortedReviewItems;
+    return sortedReviewItems.slice(0, 6);
+  }, [sortedReviewItems, showAllReviewChars]);
+
+  const hiddenReviewCount = Math.max(0, sortedReviewItems.length - 6);
 
   const loadStories = async () => {
     try {
@@ -198,8 +263,12 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     if (!targetId) return;
     setLoadingPlan(true);
     try {
-      const res = await apiClient.getStoryPlan(targetId);
-      setPlan(res);
+      const [planRes, vocabRes] = await Promise.all([
+        apiClient.getStoryPlan(targetId),
+        apiClient.getVocabulary(targetId).catch(() => [] as VocabularyEntry[])
+      ]);
+      setPlan(planRes);
+      setVocabList(vocabRes);
     } catch (err: any) {
       setErrorMsg(`拉取自适应识字计划失败：${err.message || String(err)}`);
     } finally {
@@ -238,6 +307,18 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
   }, [activeChild?.id]);
 
   useEffect(() => {
+    const dialog = menuDialogRef.current;
+    if (!dialog) return;
+    if (showHeaderMenu) {
+      if (!dialog.open && typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [showHeaderMenu]);
+
+  useEffect(() => {
     if (previewPageIndex >= sentences.length && sentences.length > 0) {
       setPreviewPageIndex(sentences.length - 1);
     }
@@ -249,21 +330,18 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     }
   }, [sentences.length, batchSourceImages]);
 
-  const currentStep = useMemo(() => {
-    if (statusMsg.includes('已发布') || statusMsg.includes('导入成功')) return 4;
-    if (Object.keys(pageImages).length > 0) return 3;
-    if (sentences.length > 0) return 2;
-    return 1;
-  }, [sentences.length, pageImages, statusMsg]);
-
   const handleCopyPrompt = async () => {
-    if (!plan?.story_generation_prompt) return;
+    if (!plan?.story_generation_prompt) {
+      setErrorMsg('正在加载识字计划提示词，请稍候再试');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(plan.story_generation_prompt);
       setCopiedPrompt(true);
-      setTimeout(() => setCopiedPrompt(false), 2500);
+      setStatusMsg('✅ 已复制 AI 提示词！可直接发给大模型生成故事，再点第 2 步导入正文。');
+      setTimeout(() => setCopiedPrompt(false), 2600);
     } catch {
-      setStatusMsg('提示词已选中，请长按或按 Ctrl+C 复制');
+      setStatusMsg('请展开下方“查看完整提示词”手动全选复制');
     }
   };
 
@@ -306,14 +384,14 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     setPageImages(distributed);
     const avgLines = (totalLines / sourceSlots.length).toFixed(1).replace(/\.0$/, '');
     setStatusMsg(
-      `已按图片数 (${sourceSlots.length}张) 与总行数 (${totalLines}行) 平均分配绑定：每张图对应约 ${avgLines} 行故事内容`
+      `已按图片数 (${sourceSlots.length}张) 与总行数 (${totalLines}行) 平均分配绑定：每张图对应约 ${avgLines} 行`
     );
   };
 
   const handlePullFromGist = async (force = false) => {
     setPullingGist(true);
     setErrorMsg('');
-    setStatusMsg('⏳ 正在从 GitHub Gist 零缓存拉取最新故事与配图并按行数平均分配绑定...');
+    setStatusMsg('⏳ 正在从 GitHub Gist 拉取最新故事与配图...');
     try {
       const res = await apiClient.pullStoryFromGist(pin, force);
       if (res.title) setTitle(res.title);
@@ -322,7 +400,6 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
       if (res.raw_text) setRawText(res.raw_text);
       setPreviewPageIndex(0);
 
-      // 始终先清空旧配图预览状态，防止已导入故事或无配图故事残留上一篇的旧图片
       setBatchSourceImages([]);
       if (res.image_urls && res.image_urls.length > 0) {
         const mappedFromGist: Record<number, PageImageSlot> = {};
@@ -345,18 +422,20 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
 
       if (res.status === 'already_imported') {
         const shouldForce = window.confirm(
-          `Gist 上的《${res.title}》（版本 ${res.version}）此前已在书架中。是否强制重新拉取并覆盖更新配图与版本？`
+          `Gist 上的《${res.title}》（版本 ${res.version}）此前已在书架中。是否强制重新拉取并覆盖更新？`
         );
         if (shouldForce) {
           await handlePullFromGist(true);
           return;
         }
         setStatusMsg(
-          `ℹ️ Gist 最新故事《${res.title}》（版本 ${res.version}，共 ${res.sentence_count} 行）已在书架中，已为您加载到编辑器预览。`
+          `ℹ️ Gist 最新故事《${res.title}》（共 ${res.sentence_count} 行）已在书架中，已加载到第 3 步预览。`
         );
+        setActiveTab('plan');
+        setExpandedStep('step3');
       } else {
         setStatusMsg(
-          `🎉 从 Gist 零缓存拉取并导入成功：《${res.title}》（版本 v${res.version_number}，${res.lines_per_image}）！`
+          `🎉 从 Gist 拉取并导入成功：《${res.title}》（v${res.version_number}，${res.lines_per_image}）！`
         );
         await loadStories();
       }
@@ -368,10 +447,11 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     }
   };
 
-  const handlePublishQuickStory = async (e: Event) => {
-    e.preventDefault();
+  const handlePublishQuickStory = async (e?: Event) => {
+    if (e) e.preventDefault();
     if (!title.trim() || sentences.length === 0) {
-      setErrorMsg('请填写故事标题并输入至少一句故事正文');
+      setErrorMsg('请先在第 2 步填写故事标题并粘贴故事正文');
+      setExpandedStep('step2');
       return;
     }
     setSubmitting(true);
@@ -383,8 +463,6 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
         .filter(([idx, slot]) => idx >= 0 && idx < sentences.length && Boolean(slot.base64Data))
         .sort(([a], [b]) => a - b);
 
-      // 组合参数：批量章节图不带 sentence_index（由后端 SaveUserPreparedImages 按 idx*N/M 平均分配），
-      // 单独手动指定的行携带显式 sentence_index 精确覆盖对应行
       const customImagesPayload: { sentence_index?: number; filename: string; data_base64: string }[] = [];
       if (batchSourceImages.length > 0) {
         for (const slot of batchSourceImages) {
@@ -425,7 +503,7 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
         image_model: imageModel.trim() || undefined
       });
       setStatusMsg(
-        `🎉 发布成功！《${title.trim()}》共生成 ${res.sentence_count} 页（版本 v${res.version_number}），已自动预缓存语音。`
+        `🎉 发布成功！《${title.trim()}》共 ${res.sentence_count} 页（v${res.version_number}），已自动预缓存语音。`
       );
       await loadStories();
     } catch (err: any) {
@@ -481,8 +559,8 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
         setStatusMsg(`✨ 全自动生成并上架成功：《${res.title}》（共 ${res.sentence_count} 页）`);
         await loadStories();
       } else {
-        setActiveTab('quick');
-        setStatusMsg(`✨ 已生成《${res.title}》草稿，请在左侧逐句检查并在右侧预览点读效果。`);
+        setExpandedStep('step3');
+        setStatusMsg(`✨ 已生成《${res.title}》草稿，请在第 3 步预览并发布。`);
       }
     } catch (err: any) {
       setErrorMsg(`自动生成失败：${err.message || String(err)}`);
@@ -541,7 +619,7 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
       const res = await apiClient.checkSystemUpdate(pin, mirrorUrl);
       setUpdateCheckInfo(res);
       if (res.has_update) {
-        setStatusMsg(`🚀 发现 GitHub 新版本 ${res.latest_version}（当前版本 ${res.current_version}），可点击下方按钮一键升级！`);
+        setStatusMsg(`🚀 发现 GitHub 新版本 ${res.latest_version}（当前 ${res.current_version}），可点击升级！`);
       } else {
         setStatusMsg(`✅ 当前已是最新版本（${res.current_version}）。`);
       }
@@ -562,7 +640,7 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     try {
       const res = await apiClient.applySystemUpdate(pin, mirrorUrl);
       setStatusMsg(
-        `🎉 升级成功（${res.previous_version || ''} -> ${res.new_version || '最新版'}）！服务正在后台平滑重启，约 3 秒后自动刷新页面...`
+        `🎉 升级成功（${res.previous_version || ''} -> ${res.new_version || '最新版'}）！服务正在后台重启，约 3 秒后刷新页面...`
       );
       setTimeout(() => {
         window.location.reload();
@@ -574,7 +652,7 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
     }
   };
 
-  const activePreviewSentence = sentences[previewPageIndex] || '小熊来到美丽的小河边，勇敢地走上木桥。';
+  const activePreviewSentence = sentences[previewPageIndex] || '太阳升起来了，杰西带着粉红色的小猪鲁本走进大森林。';
   const activePreviewTokens = useMemo(
     () => buildPreviewTokens(activePreviewSentence, previewPageIndex),
     [activePreviewSentence, previewPageIndex]
@@ -582,642 +660,591 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
   const activePreviewImage = pageImages[previewPageIndex]?.previewUrl || '';
 
   return (
-    <div class="admin-workspace">
-      {/* 左栏：监护人核心工作台 */}
-      <div class="admin-panel">
-        <header class="guardian-header">
-          <div>
-            <h2>🛡️ 监护人工作台</h2>
-            <p class="subtitle">
-              当前读者：{activeChild ? `${activeChild.avatar || '🐻'} ${activeChild.name}` : '默认读者'}
-              {healthInfo ? ` · 版本 ${healthInfo.version} (${healthInfo.arch})` : ''}
+    <div class="guardian-mobile-shell">
+      <div class="guardian-card-container">
+        {/* 顶栏：左标题与读者版本，右汉堡菜单 */}
+        <header class="guardian-top-header">
+          <div class="guardian-title-block">
+            <h1>监护人工作台</h1>
+            <p class="guardian-reader-meta">
+              读者：{activeChild ? activeChild.name : '六六'}
+              {healthInfo?.version ? ` · ${healthInfo.version}` : ' · v0.3.12'}
             </p>
           </div>
-          <div class="guardian-header-controls">
-            <label class="pin-label">
-              PIN:
-              <input
-                type="password"
-                value={pin}
-                onInput={(e) => setPin((e.target as HTMLInputElement).value)}
-                class="input-field pin-input"
-              />
-            </label>
-            <button type="button" class="btn-secondary" onClick={onClose}>
-              ← 返回书架
-            </button>
-          </div>
+          <button
+            type="button"
+            class="guardian-menu-btn"
+            onClick={() => setShowHeaderMenu(true)}
+            aria-label="打开工作台菜单与返回书架"
+            title="菜单与返回书架"
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
+              <line x1="4" y1="7" x2="20" y2="7" />
+              <line x1="4" y1="12" x2="20" y2="12" />
+              <line x1="4" y1="17" x2="20" y2="17" />
+            </svg>
+          </button>
         </header>
 
-        {/* 功能导航标签栏 */}
-        <div class="admin-tabs">
-          <button
-            type="button"
-            class={`mode-btn ${activeTab === 'prompt' ? 'active' : ''}`}
-            onClick={() => setActiveTab('prompt')}
-          >
-            🧠 AI 提示词与识字计划
-          </button>
-          <button
-            type="button"
-            class={`mode-btn ${activeTab === 'quick' ? 'active' : ''}`}
-            onClick={() => setActiveTab('quick')}
-          >
-            📝 纯净正文一键导入
-          </button>
-          <button
-            type="button"
-            class={`mode-btn ${activeTab === 'autogen' ? 'active' : ''}`}
-            onClick={() => setActiveTab('autogen')}
-          >
-            🤖 AI 全自动生成
-          </button>
-          <button
-            type="button"
-            class={`mode-btn ${activeTab === 'library' ? 'active' : ''}`}
-            onClick={() => setActiveTab('library')}
-          >
-            📚 书架与备份 ({stories.length})
-          </button>
-          <button
-            type="button"
-            class={`mode-btn ${activeTab === 'system' ? 'active' : ''}`}
-            onClick={() => setActiveTab('system')}
-          >
-            ⬆️ GitHub 在线升级
-          </button>
-        </div>
-
         {errorMsg && (
-          <div class="status-notice notice-error">
-            ⚠️ {errorMsg}
+          <div class="guardian-alert guardian-alert-error" role="alert">
+            <span>⚠️ {errorMsg}</span>
+            <button type="button" class="alert-close-btn" onClick={() => setErrorMsg('')}>✕</button>
           </div>
         )}
         {statusMsg && (
-          <div class="status-notice notice-ok">
-            {statusMsg}
+          <div class="guardian-alert guardian-alert-ok" role="status">
+            <span>{statusMsg}</span>
+            <button type="button" class="alert-close-btn" onClick={() => setStatusMsg('')}>✕</button>
           </div>
         )}
 
-        {/* Tab 0: 根据历史记录自动生成的 AI 提示词与艾宾浩斯计划 */}
-        {activeTab === 'prompt' && (
-          <section class="admin-tab-content">
-            <div class="section-header-row">
-              <div>
-                <h3 style={{ margin: 0 }}>📊 艾宾浩斯遗忘曲线识字计划 & AI 故事提示词</h3>
-                <p class="subtitle">
-                  每次退出阅读后自动根据点字记录重算，可直接复制给 Gemini / Claude / ChatGPT 生成新故事
-                </p>
+        {/* 主视图 1：识字计划 & 生成新故事三步流程 */}
+        {activeTab === 'plan' && (
+          <main class="guardian-main-body">
+            {/* 2x2 统计四宫格 */}
+            <section class="guardian-stats-grid" aria-label="识字统计概览">
+              <div class="stat-tile stat-tile-mastered">
+                <span class="stat-tile-label">已掌握字</span>
+                <strong class="stat-tile-value">{masteredCount}</strong>
               </div>
-              <div class="header-actions-inline">
+              <div class="stat-tile stat-tile-urgent">
+                <span class="stat-tile-label">急需复习</span>
+                <strong class="stat-tile-value">{urgentReviewCount}</strong>
+              </div>
+              <div class="stat-tile stat-tile-observe">
+                <span class="stat-tile-label">待巩固</span>
+                <strong class="stat-tile-value">{observeCount}</strong>
+              </div>
+              <div class="stat-tile stat-tile-new">
+                <span class="stat-tile-label">本篇新字</span>
+                <strong class="stat-tile-value">{newCandidateCount}</strong>
+              </div>
+            </section>
+
+            {/* 复习字保留率从低到高排序列表 + 彩色进度条 */}
+            <section class="guardian-review-section">
+              <div class="section-caption-row">
+                <h2 class="section-caption">复习字，保留率低的在前</h2>
                 <button
                   type="button"
-                  class="btn-secondary"
+                  class="text-link-btn"
                   disabled={loadingPlan}
                   onClick={() => void loadStoryPlan()}
                 >
-                  {loadingPlan ? '🔄 计算中...' : '🔄 刷新最新记录'}
-                </button>
-                <button
-                  type="button"
-                  class="btn-primary"
-                  disabled={!plan?.story_generation_prompt}
-                  onClick={handleCopyPrompt}
-                >
-                  {copiedPrompt ? '✅ 已复制提示词！' : '📋 一键复制 AI 提示词'}
-                </button>
-                <button
-                  type="button"
-                  class="btn-secondary"
-                  disabled={pullingGist}
-                  onClick={() => void handlePullFromGist(false)}
-                >
-                  {pullingGist ? '⏳ 拉取中...' : '☁️ 从 Gist 拉取新故事（零缓存）'}
+                  {loadingPlan ? '刷新中...' : '刷新'}
                 </button>
               </div>
-            </div>
 
-            {plan ? (
-              <>
-                <div class="plan-badges">
-                  <div>
-                    <strong>🔥 急需复习字（{plan.review_targets?.length || 0}）：</strong>
-                    {plan.review_targets?.length ? (
-                      plan.review_targets.map((t) => (
-                        <span key={t.character + t.pinyin} class="word-badge badge-review" title={t.reason}>
-                          {t.character}({t.pinyin} · 保留率{t.retention_pct ?? '--'}%)
-                        </span>
-                      ))
-                    ) : (
-                      <span class="subtitle">当前无紧急遗忘字</span>
-                    )}
-                  </div>
+              {sortedReviewItems.length > 0 ? (
+                <div class="retention-list">
+                  {visibleReviewItems.map((item) => {
+                    const pct = item.computedPct;
+                    const barColorClass =
+                      pct <= 15
+                        ? 'retention-fill-low'
+                        : pct <= 30
+                        ? 'retention-fill-mid'
+                        : 'retention-fill-high';
 
-                  <div>
-                    <strong>⏳ 待巩固观察字（{plan.observe_targets?.length || 0}）：</strong>
-                    {plan.observe_targets?.length ? (
-                      plan.observe_targets.map((t) => (
-                        <span key={t.character + t.pinyin} class="word-badge badge-observe" title={t.reason}>
-                          {t.character}({t.pinyin})
-                        </span>
-                      ))
-                    ) : (
-                      <span class="subtitle">当前无待巩固字</span>
-                    )}
-                  </div>
-
-                  <div>
-                    <strong>🌱 本篇科学引入拓展新字（{plan.new_candidates?.length || 0}）：</strong>
-                    {plan.new_candidates?.length ? (
-                      plan.new_candidates.map((t) => (
-                        <span key={t.character + t.pinyin} class="word-badge badge-new" title={t.reason}>
-                          {t.character}({t.pinyin}：{(t.recommended_words || []).slice(0, 2).join('/')})
-                        </span>
-                      ))
-                    ) : (
-                      <span class="subtitle">无</span>
-                    )}
-                  </div>
-                </div>
-
-                <div class="prompt-box-wrap">
-                  <div class="prompt-box-header">
-                    <strong>📜 自动生成的完整 AI 提示词（含全部已掌握熟字 + 遗忘曲线生字 + 拓展新字）：</strong>
-                    <button
-                      type="button"
-                      class="btn-secondary"
-                      style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-                      onClick={() => setActiveTab('quick')}
-                    >
-                      去粘贴生成好的故事正文 →
-                    </button>
-                  </div>
-                  <textarea
-                    readOnly
-                    class="story-textarea prompt-readonly-box"
-                    rows={14}
-                    value={plan.story_generation_prompt || '暂无提示词数据'}
-                    onClick={(e) => (e.target as HTMLTextAreaElement).select()}
-                  />
-                </div>
-              </>
-            ) : (
-              <p class="subtitle">{loadingPlan ? '正在加载六六的识字历史...' : '暂无识字计划数据'}</p>
-            )}
-          </section>
-        )}
-
-        {/* Tab 1: 一键纯净正文导入 */}
-        {activeTab === 'quick' && (
-          <form onSubmit={handlePublishQuickStory} class="admin-tab-content">
-            <div class="pipeline-bar">
-              <span class="pipeline-step" data-state={currentStep >= 1 ? (currentStep > 1 ? 'done' : 'active') : ''}>
-                1. 粘贴纯净正文
-              </span>
-              <span>→</span>
-              <span class="pipeline-step" data-state={currentStep >= 2 ? (currentStep > 2 ? 'done' : 'active') : ''}>
-                2. 自动单句分页 ({sentences.length}页)
-              </span>
-              <span>→</span>
-              <span class="pipeline-step" data-state={currentStep >= 3 ? (currentStep > 3 ? 'done' : 'active') : ''}>
-                3. 绑定插画 ({Object.keys(pageImages).length}/{sentences.length || 0})
-              </span>
-              <span>→</span>
-              <span class="pipeline-step" data-state={currentStep === 4 ? 'done' : ''}>
-                4. 上架书架
-              </span>
-            </div>
-
-            <div class="form-row">
-              <label style={{ flex: '1 1 200px' }}>
-                <span class="field-label">故事标题 *</span>
-                <input
-                  type="text"
-                  required
-                  placeholder="例如：小猪鲁本与木桥冒险"
-                  value={title}
-                  onInput={(e) => setTitle((e.target as HTMLInputElement).value)}
-                  class="input-field full-width"
-                />
-              </label>
-
-              <label style={{ flex: '1 1 200px' }}>
-                <span class="field-label">故事主题</span>
-                <input
-                  type="text"
-                  list="preset-themes-list"
-                  value={theme}
-                  onInput={(e) => setTheme((e.target as HTMLInputElement).value)}
-                  class="input-field full-width"
-                />
-                <datalist id="preset-themes-list">
-                  {PRESET_THEMES.map((t) => (
-                    <option key={t} value={t} />
-                  ))}
-                </datalist>
-              </label>
-            </div>
-
-            <label class="block-label">
-              <div class="prompt-box-header">
-                <span>故事正文（每行一句，或按句号自动拆页）*</span>
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    style={{ padding: '4px 10px', fontSize: '0.82rem' }}
-                    disabled={pullingGist}
-                    onClick={() => void handlePullFromGist(false)}
-                  >
-                    {pullingGist ? '⏳ 正在从 Gist 拉取...' : '☁️ 从 Gist 拉取故事与配图（零缓存）'}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    style={{ padding: '4px 10px', fontSize: '0.82rem' }}
-                    onClick={() => setActiveTab('prompt')}
-                  >
-                    📋 查看/复制 AI 提示词
-                  </button>
-                </div>
-              </div>
-              <textarea
-                class="story-textarea"
-                placeholder={'请直接粘贴纯净故事正文，每行 1 句话：\n小熊来到哗哗流淌的小河边。\n鹿阿姨告诉他前面有一座安全的木桥。'}
-                value={rawText}
-                onInput={(e) => setRawText((e.target as HTMLTextAreaElement).value)}
-              />
-            </label>
-
-            {sentences.length > 0 && (
-              <div style={{ marginBottom: '18px' }}>
-                <div class="prompt-box-header" style={{ marginBottom: '10px' }}>
-                  <strong>🔍 逐句分页与多音字检查（点击任意行在右侧预览）</strong>
-                  <div>
-                    <input
-                      ref={batchImgInputRef}
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      style={{ display: 'none' }}
-                      onChange={(e) => handleBatchImagesUpload((e.target as HTMLInputElement).files)}
-                    />
-                    <button
-                      type="button"
-                      class="btn-secondary"
-                      style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-                      onClick={() => batchImgInputRef.current?.click()}
-                    >
-                      🖼️ 批量上传并按行数平均分配配图
-                    </button>
-                  </div>
-                </div>
-
-                <div class="page-inspector-list">
-                  {sentences.map((sent, idx) => {
-                    const chars = Array.from(sent);
-                    const hasImg = Boolean(pageImages[idx]);
                     return (
-                      <div
-                        key={idx}
-                        class="page-row"
-                        data-active={previewPageIndex === idx ? 'true' : 'false'}
-                        onClick={() => setPreviewPageIndex(idx)}
-                      >
-                        <span class="page-badge">P{String(idx + 1).padStart(2, '0')}</span>
-
-                        <div class="seg-list">
-                          {chars.map((ch, cIdx) => {
-                            if (PUNCTUATION.has(ch)) {
-                              return (
-                                <span key={cIdx} style={{ alignSelf: 'center', color: 'var(--text-pinyin)' }}>
-                                  {ch}
-                                </span>
-                              );
-                            }
-                            const isPoly = POLYPHONIC_CHARS.has(ch);
-                            const isRev = reviewCharSet.has(ch);
-                            return (
-                              <span
-                                key={cIdx}
-                                class="seg-chip"
-                                data-polyphonic={isPoly ? 'true' : 'false'}
-                                data-review={isRev ? 'true' : 'false'}
-                                title={
-                                  isPoly
-                                    ? '多音字（发布时由后端语境词典自动定音）'
-                                    : isRev
-                                    ? '本篇目标复习/拓展生字'
-                                    : ''
-                                }
-                              >
-                                <span>{ch}</span>
-                              </span>
-                            );
-                          })}
+                      <div key={item.character + item.pinyin} class="retention-row">
+                        <div class="retention-char-cell">
+                          <span class="retention-hanzi">{item.character}</span>
+                          <span class="retention-pinyin">{item.pinyin}</span>
                         </div>
-
-                        <label
-                          class="btn-secondary"
-                          style={{ padding: '6px 10px', fontSize: '0.8rem', cursor: 'pointer', whiteSpace: 'nowrap' }}
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {hasImg
-                            ? pageImages[idx]?.groupIndex
-                              ? `✅ 图${pageImages[idx].groupIndex}/${pageImages[idx].groupTotal}`
-                              : '✅ 已配图'
-                            : '+ 配图'}
-                          <input
-                            type="file"
-                            accept="image/*"
-                            style={{ display: 'none' }}
-                            onChange={(e) =>
-                              handleSinglePageImageUpload(idx, (e.target as HTMLInputElement).files?.[0])
-                            }
-                          />
-                        </label>
+                        <div class="retention-track" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+                          <div class={`retention-fill ${barColorClass}`} style={{ width: `${Math.max(6, pct)}%` }} />
+                        </div>
+                        <span class="retention-pct">{pct}%</span>
                       </div>
                     );
                   })}
-                </div>
-              </div>
-            )}
 
-            <div class="guardian-actions">
-              <button type="submit" class="btn-primary" disabled={submitting || sentences.length === 0}>
-                {submitting ? '⏳ 正在打包并预缓存语音...' : `🚀 立即发布到书架（共 ${sentences.length} 页）`}
-              </button>
-            </div>
-          </form>
+                  {hiddenReviewCount > 0 && (
+                    <button
+                      type="button"
+                      class="retention-more-btn"
+                      onClick={() => setShowAllReviewChars(!showAllReviewChars)}
+                    >
+                      {showAllReviewChars
+                        ? '收起部分复习字'
+                        : `另有 ${hiddenReviewCount} 个，查看全部`}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <p class="empty-hint-text">
+                  {loadingPlan ? '正在计算六六的艾宾浩斯遗忘曲线...' : '当前暂无急需复习字，继续保持阅读吧！'}
+                </p>
+              )}
+            </section>
+
+            {/* 生成新故事，三步 */}
+            <section class="guardian-steps-section">
+              <h2 class="section-caption">生成新故事，三步</h2>
+
+              <div class="three-steps-stack">
+                {/* Step 1: 复制 AI 提示词 */}
+                <button
+                  type="button"
+                  class="step-action-btn step-action-primary"
+                  onClick={handleCopyPrompt}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                  <span>1 &nbsp;{copiedPrompt ? '已复制 AI 提示词 ✓' : '复制 AI 提示词'}</span>
+                </button>
+
+                {/* Step 2: 导入故事正文 */}
+                <button
+                  type="button"
+                  class={`step-action-btn step-action-outline ${expandedStep === 'step2' ? 'is-expanded' : ''}`}
+                  onClick={() => setExpandedStep(expandedStep === 'step2' ? null : 'step2')}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
+                  </svg>
+                  <span>
+                    2 &nbsp;导入故事正文
+                    {sentences.length > 0 ? `（已拆 ${sentences.length} 页）` : ''}
+                  </span>
+                </button>
+
+                {expandedStep === 'step2' && (
+                  <div class="step-drawer-card">
+                    <div class="drawer-quick-row">
+                      <button
+                        type="button"
+                        class="btn-inline-action"
+                        disabled={pullingGist}
+                        onClick={() => void handlePullFromGist(false)}
+                      >
+                        {pullingGist ? '⏳ 正在拉取...' : '☁️ 从 Gist 一键拉取最新故事与配图'}
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-inline-action"
+                        onClick={() => setShowAutoGenPanel(!showAutoGenPanel)}
+                      >
+                        {showAutoGenPanel ? '收起 AI 自动生成' : '🤖 AI 全自动生成'}
+                      </button>
+                    </div>
+
+                    {showAutoGenPanel && (
+                      <div class="autogen-mini-box">
+                        <label class="compact-field">
+                          <span>探险主题</span>
+                          <input
+                            type="text"
+                            list="preset-themes-list"
+                            value={autoTheme}
+                            onInput={(e) => setAutoTheme((e.target as HTMLInputElement).value)}
+                            class="compact-input"
+                          />
+                        </label>
+                        <div class="drawer-quick-row">
+                          <button
+                            type="button"
+                            class="btn-inline-action"
+                            disabled={submitting}
+                            onClick={() => void handleAutoGenerate(false)}
+                          >
+                            {submitting ? '生成中...' : '生成草稿'}
+                          </button>
+                          <button
+                            type="button"
+                            class="btn-inline-primary"
+                            disabled={submitting}
+                            onClick={() => void handleAutoGenerate(true)}
+                          >
+                            {submitting ? '生成中...' : '⚡ 生成并直接发布'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <label class="compact-field">
+                      <span>故事标题 *</span>
+                      <input
+                        type="text"
+                        required
+                        placeholder="例如：小猪鲁本与森林木桥"
+                        value={title}
+                        onInput={(e) => setTitle((e.target as HTMLInputElement).value)}
+                        class="compact-input"
+                      />
+                    </label>
+
+                    <label class="compact-field">
+                      <span>故事主题</span>
+                      <input
+                        type="text"
+                        list="preset-themes-list"
+                        value={theme}
+                        onInput={(e) => setTheme((e.target as HTMLInputElement).value)}
+                        class="compact-input"
+                      />
+                      <datalist id="preset-themes-list">
+                        {PRESET_THEMES.map((t) => (
+                          <option key={t} value={t} />
+                        ))}
+                      </datalist>
+                    </label>
+
+                    <label class="compact-field">
+                      <span>故事正文（每行一句，或按句号自动拆页）*</span>
+                      <textarea
+                        class="compact-textarea"
+                        rows={6}
+                        placeholder={'太阳升起来了，杰西带着粉红色的小猪鲁本走进大森林。\n他们来到小河边，稳稳地走过木桥。'}
+                        value={rawText}
+                        onInput={(e) => setRawText((e.target as HTMLTextAreaElement).value)}
+                      />
+                    </label>
+
+                    <div class="drawer-quick-row">
+                      <input
+                        ref={batchImgInputRef}
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={(e) => handleBatchImagesUpload((e.target as HTMLInputElement).files)}
+                      />
+                      <button
+                        type="button"
+                        class="btn-inline-action"
+                        onClick={() => batchImgInputRef.current?.click()}
+                      >
+                        🖼️ 批量上传配图 ({Object.keys(pageImages).length}/{sentences.length || 0})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-inline-primary"
+                        onClick={() => setExpandedStep('step3')}
+                      >
+                        下一步：去预览并发布 →
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Step 3: 预览并发布到书架 */}
+                <button
+                  type="button"
+                  class={`step-action-btn step-action-outline ${expandedStep === 'step3' ? 'is-expanded' : ''}`}
+                  onClick={() => setExpandedStep(expandedStep === 'step3' ? null : 'step3')}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  <span>3 &nbsp;预览并发布到书架</span>
+                </button>
+
+                {expandedStep === 'step3' && (
+                  <div class="step-drawer-card">
+                    <div class="preview-mini-header">
+                      <span>
+                        <strong>{title || '未命名故事预览'}</strong> · 第 {previewPageIndex + 1} / {Math.max(1, sentences.length)} 页
+                      </span>
+                      <button
+                        type="button"
+                        class="text-link-btn"
+                        onClick={() => setPreviewShowPinyin(!previewShowPinyin)}
+                      >
+                        {previewShowPinyin ? '隐藏常驻拼音' : '开启常驻拼音'}
+                      </button>
+                    </div>
+
+                    <div class="preview-mini-stage">
+                      <div class="reader-illustration-compact" style={{ maxHeight: '140px' }}>
+                        {activePreviewImage ? (
+                          <img src={activePreviewImage} alt="预览配图" class="story-image" />
+                        ) : (
+                          <div class="story-image-placeholder">
+                            <span>第 {previewPageIndex + 1} 页插画预览（发布时支持自动配图）</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <SentenceDisplay
+                        tokens={activePreviewTokens}
+                        activeWordIndex={null}
+                        activeTokenId={previewActiveTokenId}
+                        showPinyinHint={previewShowPinyin}
+                        reviewChars={reviewCharSet}
+                        newChars={newCharSet}
+                        showLegend={false}
+                        onTokenClick={(tok) => {
+                          setPreviewActiveTokenId(tok.id);
+                          if (previewTimerRef.current !== null) {
+                            window.clearTimeout(previewTimerRef.current);
+                          }
+                          previewTimerRef.current = window.setTimeout(() => {
+                            setPreviewActiveTokenId(null);
+                            previewTimerRef.current = null;
+                          }, PREVIEW_PINYIN_DURATION_MS);
+                          void audioPlayer.playUrlOrFallback('', tok.character);
+                        }}
+                      />
+
+                      <div class="preview-mini-nav">
+                        <button
+                          type="button"
+                          class="btn-inline-action"
+                          disabled={previewPageIndex <= 0}
+                          onClick={() => setPreviewPageIndex((p) => Math.max(0, p - 1))}
+                        >
+                          ‹ 上一页
+                        </button>
+                        <button
+                          type="button"
+                          class="btn-inline-action"
+                          onClick={() => void audioPlayer.playUrlOrFallback('', activePreviewSentence)}
+                        >
+                          🔊 试听
+                        </button>
+                        <button
+                          type="button"
+                          class="btn-inline-action"
+                          disabled={previewPageIndex >= Math.max(0, sentences.length - 1)}
+                          onClick={() =>
+                            setPreviewPageIndex((p) => Math.min(Math.max(0, sentences.length - 1), p + 1))
+                          }
+                        >
+                          下一页 ›
+                        </button>
+                      </div>
+                    </div>
+
+                    {sentences.length > 0 && (
+                      <div class="page-inspector-compact">
+                        {sentences.map((sent, idx) => {
+                          const hasImg = Boolean(pageImages[idx]);
+                          return (
+                            <div
+                              key={idx}
+                              class={`inspector-compact-row ${previewPageIndex === idx ? 'is-active' : ''}`}
+                              onClick={() => setPreviewPageIndex(idx)}
+                            >
+                              <span class="inspector-page-num">P{idx + 1}</span>
+                              <span class="inspector-sent-text">{sent}</span>
+                              <label
+                                class="inspector-upload-tag"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {hasImg ? '已配图' : '+配图'}
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  style={{ display: 'none' }}
+                                  onChange={(e) =>
+                                    handleSinglePageImageUpload(idx, (e.target as HTMLInputElement).files?.[0])
+                                  }
+                                />
+                              </label>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      class="step-action-btn step-action-primary"
+                      disabled={submitting || sentences.length === 0}
+                      onClick={() => void handlePublishQuickStory()}
+                    >
+                      {submitting
+                        ? '⏳ 正在打包并预缓存语音...'
+                        : `🚀 确认发布到书架（共 ${sentences.length} 页）`}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* 查看完整提示词：默认折叠 */}
+              <details class="prompt-collapse-details">
+                <summary class="prompt-collapse-summary">
+                  <span>查看完整提示词</span>
+                  <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </summary>
+                <div class="prompt-collapse-body">
+                  <textarea
+                    readOnly
+                    class="compact-textarea prompt-mono-box"
+                    rows={10}
+                    value={plan?.story_generation_prompt || '暂无提示词数据'}
+                    onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+                  />
+                </div>
+              </details>
+            </section>
+          </main>
         )}
 
-        {/* Tab 2: AI 全自动生成 */}
-        {activeTab === 'autogen' && (
-          <div class="admin-tab-content">
-            <p style={{ marginTop: 0, color: 'var(--text-pinyin)', fontSize: '0.92rem' }}>
-              根据六六的艾宾浩斯遗忘曲线计划，全自动生成 10 分钟阅读量分级故事与无字绘本插画。
-            </p>
-
-            <label class="block-label">
-              <span class="field-label">选择探险主题</span>
-              <input
-                type="text"
-                list="preset-themes-list"
-                value={autoTheme}
-                onInput={(e) => setAutoTheme((e.target as HTMLInputElement).value)}
-                class="input-field full-width"
-              />
-            </label>
-
-            <div style={{ marginBottom: '14px' }}>
+        {/* 主视图 2：书架管理 */}
+        {activeTab === 'bookshelf' && (
+          <main class="guardian-main-body">
+            <div class="section-caption-row">
+              <h2 class="section-caption">故事书架管理（共 {stories.length} 篇）</h2>
               <button
                 type="button"
-                class="btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-                onClick={() => setShowApiConfig(!showApiConfig)}
+                class="text-link-btn"
+                disabled={pullingGist}
+                onClick={() => void handlePullFromGist(false)}
               >
-                {showApiConfig ? '▼ 收起外部大模型/绘图 API 配置' : '▶ 展开外部大模型/绘图 API 配置（可选）'}
+                {pullingGist ? '拉取中...' : '从 Gist 同步'}
               </button>
             </div>
 
-            {showApiConfig && (
-              <div class="api-config-box">
-                <div class="form-row">
-                  <label style={{ flex: '1 1 200px' }}>
-                    <span style={{ fontSize: '0.82rem' }}>LLM 接口地址 (OpenAI 兼容)</span>
-                    <input
-                      type="text"
-                      placeholder="留空默认使用服务端配置"
-                      value={llmApiUrl}
-                      onInput={(e) => setLlmApiUrl((e.target as HTMLInputElement).value)}
-                      class="input-field full-width"
-                    />
-                  </label>
-                  <label style={{ flex: '1 1 160px' }}>
-                    <span style={{ fontSize: '0.82rem' }}>LLM 模型名称</span>
-                    <input
-                      type="text"
-                      placeholder="如 deepseek-chat"
-                      value={llmModel}
-                      onInput={(e) => setLlmModel((e.target as HTMLInputElement).value)}
-                      class="input-field full-width"
-                    />
-                  </label>
-                </div>
-                <label class="block-label">
-                  <span style={{ fontSize: '0.82rem' }}>LLM API Key</span>
-                  <input
-                    type="password"
-                    placeholder="sk-..."
-                    value={llmApiKey}
-                    onInput={(e) => setLlmApiKey((e.target as HTMLInputElement).value)}
-                    class="input-field full-width"
-                  />
-                </label>
-
-                <div class="form-row">
-                  <label style={{ flex: '1 1 200px' }}>
-                    <span style={{ fontSize: '0.82rem' }}>绘图 API 地址 (可选)</span>
-                    <input
-                      type="text"
-                      placeholder="留空自动生成清新矢量插画"
-                      value={imageApiUrl}
-                      onInput={(e) => setImageApiUrl((e.target as HTMLInputElement).value)}
-                      class="input-field full-width"
-                    />
-                  </label>
-                  <label style={{ flex: '1 1 160px' }}>
-                    <span style={{ fontSize: '0.82rem' }}>绘图模型</span>
-                    <input
-                      type="text"
-                      placeholder="如 flux / dall-e-3"
-                      value={imageModel}
-                      onInput={(e) => setImageModel((e.target as HTMLInputElement).value)}
-                      class="input-field full-width"
-                    />
-                  </label>
-                </div>
-                <label class="block-label" style={{ marginBottom: 0 }}>
-                  <span style={{ fontSize: '0.82rem' }}>绘图 API Key</span>
-                  <input
-                    type="password"
-                    value={imageApiKey}
-                    onInput={(e) => setImageApiKey((e.target as HTMLInputElement).value)}
-                    class="input-field full-width"
-                  />
-                </label>
+            {stories.length === 0 ? (
+              <p class="empty-hint-text">书架暂无故事，可在「识字计划」按三步流程导入或从 Gist 拉取。</p>
+            ) : (
+              <div class="story-manage-list">
+                {stories.map((st) => (
+                  <div key={st.id} class="story-manage-row">
+                    <div class="story-manage-info">
+                      <strong>{st.title}</strong>
+                      <span>v{st.version_number} · {st.theme} · 共 {st.sentence_count} 页</span>
+                    </div>
+                    <button
+                      type="button"
+                      class="btn-danger-outline"
+                      onClick={() => void handleDeleteStory(st)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
-
-            <div class="guardian-actions">
-              <button
-                type="button"
-                class="btn-secondary"
-                disabled={submitting}
-                onClick={() => handleAutoGenerate(false)}
-              >
-                {submitting ? '生成中...' : '📝 生成草稿到编辑器检查'}
-              </button>
-              <button
-                type="button"
-                class="btn-primary"
-                disabled={submitting}
-                onClick={() => handleAutoGenerate(true)}
-              >
-                {submitting ? '生成并发布中...' : '⚡ 一键全自动生成并上架'}
-              </button>
-            </div>
-          </div>
+          </main>
         )}
 
-        {/* Tab 3: 书架管理、ZIP 导入与数据导出 */}
-        {activeTab === 'library' && (
-          <div class="admin-tab-content">
-            <div class="guardian-actions" style={{ marginTop: 0, marginBottom: '18px' }}>
+        {/* 主视图 3：数据备份与离线导入 */}
+        {activeTab === 'backup' && (
+          <main class="guardian-main-body">
+            <h2 class="section-caption">数据备份与离线导入</h2>
+            <div class="three-steps-stack">
               <input
                 ref={zipInputRef}
                 type="file"
                 accept=".zip"
                 style={{ display: 'none' }}
-                onChange={(e) => handleZipImport((e.target as HTMLInputElement).files?.[0])}
+                onChange={(e) => void handleZipImport((e.target as HTMLInputElement).files?.[0])}
               />
               <button
                 type="button"
-                class="btn-primary"
-                style={{ padding: '8px 14px', fontSize: '0.9rem' }}
-                disabled={pullingGist}
-                onClick={() => void handlePullFromGist(false)}
-              >
-                {pullingGist ? '⏳ 正在从 Gist 拉取...' : '☁️ 从 Gist 拉取新故事（零缓存）'}
-              </button>
-              <button
-                type="button"
-                class="btn-secondary"
-                style={{ padding: '8px 14px', fontSize: '0.9rem' }}
+                class="step-action-btn step-action-outline"
                 onClick={() => zipInputRef.current?.click()}
               >
                 📦 导入离线 ZIP 故事包
               </button>
+
               <a
                 href={`/api/v1/admin/export?format=json&pin=${encodeURIComponent(pin)}`}
                 target="_blank"
                 rel="noreferrer"
-                class="btn-secondary"
-                style={{ padding: '8px 14px', fontSize: '0.9rem' }}
+                class="step-action-btn step-action-outline"
+                style={{ textDecoration: 'none' }}
               >
-                ⬇️ 导出 JSON 学习记录
+                ⬇️ 导出 JSON 识字学习记录
               </a>
+
               <a
                 href={`/api/v1/admin/export?format=sqlite&pin=${encodeURIComponent(pin)}`}
                 target="_blank"
                 rel="noreferrer"
-                class="btn-secondary"
-                style={{ padding: '8px 14px', fontSize: '0.9rem' }}
+                class="step-action-btn step-action-outline"
+                style={{ textDecoration: 'none' }}
               >
-                💾 备份 SQLite 数据库
+                💾 备份 SQLite 数据库文件
               </a>
+
               {activeChild && (
                 <button
                   type="button"
-                  class="btn-danger"
-                  style={{ padding: '8px 14px', fontSize: '0.9rem' }}
-                  onClick={handleDeleteCurrentChild}
+                  class="step-action-btn step-action-danger"
+                  onClick={() => void handleDeleteCurrentChild()}
                 >
-                  🗑️ 删除当前儿童档案
+                  🗑️ 删除当前读者档案（{activeChild.name}）
                 </button>
               )}
             </div>
-
-            <div class="page-inspector-list">
-              {stories.map((st) => (
-                <div key={st.id} class="page-row" style={{ cursor: 'default' }}>
-                  <span class="page-badge">v{st.version_number}</span>
-                  <div>
-                    <strong>{st.title}</strong>
-                    <div style={{ fontSize: '0.82rem', color: 'var(--text-pinyin)' }}>
-                      {st.theme} · 共 {st.sentence_count} 句
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    class="btn-danger"
-                    style={{ padding: '6px 12px', fontSize: '0.82rem' }}
-                    onClick={() => handleDeleteStory(st)}
-                  >
-                    删除
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
+          </main>
         )}
 
-        {/* Tab 4: GitHub 在线升级与系统状态 */}
-        {activeTab === 'system' && (
-          <div class="admin-tab-content">
-            <h3 style={{ marginTop: 0 }}>⬆️ 从 GitHub 检查更新与一键在线升级</h3>
-            <p class="subtitle" style={{ marginBottom: '16px' }}>
-              支持从 GitHub Releases 自动拉取对应架构二进制包，校验 SHA256 后热替换重启，若启动异常自动回滚。
-            </p>
+        {/* 主视图 4：GitHub 在线升级 */}
+        {activeTab === 'upgrade' && (
+          <main class="guardian-main-body">
+            <h2 class="section-caption">系统状态与在线升级</h2>
 
             {healthInfo && (
-              <div class="system-info-grid">
-                <div class="sys-stat-card">
-                  <span class="subtitle">当前运行版本</span>
+              <div class="upgrade-stats-row">
+                <div class="upgrade-stat-pill">
+                  <span>当前版本</span>
                   <strong>{healthInfo.version}</strong>
                 </div>
-                <div class="sys-stat-card">
-                  <span class="subtitle">系统架构</span>
+                <div class="upgrade-stat-pill">
+                  <span>架构</span>
                   <strong>{healthInfo.arch}</strong>
                 </div>
-                <div class="sys-stat-card">
-                  <span class="subtitle">可用磁盘空间</span>
+                <div class="upgrade-stat-pill">
+                  <span>可用空间</span>
                   <strong>{healthInfo.free_disk_mb} MB</strong>
                 </div>
               </div>
             )}
 
-            <label class="block-label" style={{ marginTop: '16px' }}>
-              <span class="field-label">GitHub 国内加速镜像前缀（可选，直连可留空）</span>
+            <label class="compact-field" style={{ marginTop: '12px' }}>
+              <span>GitHub 加速镜像前缀（直连可留空）</span>
               <input
                 type="text"
-                placeholder="例如 https://ghproxy.net/ 或留空直连"
+                placeholder="https://ghproxy.net/ 或留空"
                 value={mirrorUrl}
                 onInput={(e) => setMirrorUrl((e.target as HTMLInputElement).value)}
-                class="input-field full-width"
+                class="compact-input"
               />
             </label>
 
-            <div class="guardian-actions">
+            <div class="three-steps-stack" style={{ marginTop: '14px' }}>
               <button
                 type="button"
-                class="btn-secondary"
+                class="step-action-btn step-action-outline"
                 disabled={checkingUpdate || applyingUpdate}
-                onClick={handleCheckUpdate}
+                onClick={() => void handleCheckUpdate()}
               >
                 {checkingUpdate ? '🔍 正在连接 GitHub 检查...' : '🔍 检查 GitHub 最新版本'}
               </button>
 
               <button
                 type="button"
-                class="btn-primary"
+                class="step-action-btn step-action-primary"
                 disabled={applyingUpdate}
-                onClick={handleApplyUpdate}
+                onClick={() => void handleApplyUpdate()}
               >
                 {applyingUpdate ? '⏳ 正在下载并升级重启...' : '🚀 立即从 GitHub 下载并升级'}
               </button>
             </div>
 
             {updateCheckInfo && (
-              <div class="api-config-box" style={{ marginTop: '16px' }}>
-                <div>
-                  <strong>检查结果：</strong>
-                  当前版本 <code>{updateCheckInfo.current_version}</code> · 最新版本{' '}
+              <div class="step-drawer-card" style={{ marginTop: '14px' }}>
+                <div style={{ fontSize: '0.9rem' }}>
+                  当前 <code>{updateCheckInfo.current_version}</code> · 最新{' '}
                   <code>{updateCheckInfo.latest_version}</code>{' '}
                   {updateCheckInfo.has_update ? (
-                    <span class="word-badge badge-new">有新版本可升级</span>
+                    <strong style={{ color: '#15803d' }}>（有新版本可升级）</strong>
                   ) : (
-                    <span class="word-badge badge-observe">已是最新</span>
+                    <span style={{ color: 'var(--text-pinyin)' }}>（已是最新）</span>
                   )}
                 </div>
                 {updateCheckInfo.release_notes && (
@@ -1225,127 +1252,88 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
                 )}
               </div>
             )}
-          </div>
+          </main>
         )}
+
+        {/* 底部四栏导航：识字计划 | 书架 | 备份 | 升级 */}
+        <nav class="guardian-bottom-nav" aria-label="监护人工作台导航">
+          <button
+            type="button"
+            class={`bottom-nav-item ${activeTab === 'plan' ? 'is-active' : ''}`}
+            onClick={() => setActiveTab('plan')}
+          >
+            识字计划
+          </button>
+          <button
+            type="button"
+            class={`bottom-nav-item ${activeTab === 'bookshelf' ? 'is-active' : ''}`}
+            onClick={() => setActiveTab('bookshelf')}
+          >
+            书架
+          </button>
+          <button
+            type="button"
+            class={`bottom-nav-item ${activeTab === 'backup' ? 'is-active' : ''}`}
+            onClick={() => setActiveTab('backup')}
+          >
+            备份
+          </button>
+          <button
+            type="button"
+            class={`bottom-nav-item ${activeTab === 'upgrade' ? 'is-active' : ''}`}
+            onClick={() => setActiveTab('upgrade')}
+          >
+            升级
+          </button>
+        </nav>
       </div>
 
-      {/* 右栏：1:1 儿童点读模拟器实时预览 */}
-      <aside class="admin-panel preview-sticky">
-        <div class="prompt-box-header">
-          <div>
-            <h3 style={{ margin: 0, fontSize: '1.05rem' }}>📱 儿童点读实时预览</h3>
-            <span style={{ fontSize: '0.8rem', color: 'var(--text-pinyin)' }}>
-              默认隐藏拼音，点击汉字测试语音与 10 秒拼音气泡
-            </span>
-          </div>
-          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+      {/* 右上角菜单弹窗：PIN 设置与返回阅读书架 */}
+      <dialog
+        ref={menuDialogRef}
+        class="reader-settings-dialog"
+        onClick={(e) => {
+          if (e.target === menuDialogRef.current) {
+            setShowHeaderMenu(false);
+          }
+        }}
+        onCancel={() => setShowHeaderMenu(false)}
+      >
+        <div class="reader-settings-sheet">
+          <div class="settings-sheet-header">
+            <strong>工作台设置与导航</strong>
             <button
               type="button"
-              class={`mode-btn ${previewOrientation === 'landscape' ? 'active' : ''}`}
-              style={{ padding: '4px 10px', fontSize: '0.8rem' }}
-              onClick={() => setPreviewOrientation('landscape')}
+              class="reader-icon-btn"
+              onClick={() => setShowHeaderMenu(false)}
+              aria-label="关闭菜单"
             >
-              横屏 4:3
-            </button>
-            <button
-              type="button"
-              class={`mode-btn ${previewOrientation === 'portrait' ? 'active' : ''}`}
-              style={{ padding: '4px 10px', fontSize: '0.8rem' }}
-              onClick={() => setPreviewOrientation('portrait')}
-            >
-              竖屏 3:4
-            </button>
-            <button
-              type="button"
-              class={`mode-btn ${previewShowPinyin ? 'active' : ''}`}
-              style={{ padding: '4px 10px', fontSize: '0.8rem' }}
-              onClick={() => setPreviewShowPinyin(!previewShowPinyin)}
-            >
-              {previewShowPinyin ? '常驻拼音:开' : '常驻拼音:关'}
+              ✕
             </button>
           </div>
-        </div>
 
-        <div class="preview-viewport" data-orientation={previewOrientation}>
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              justifyContent: 'space-between',
-              width: '100%',
-              height: '100%',
-              gap: '12px'
+          <label class="compact-field">
+            <span>监护人 PIN 码</span>
+            <input
+              type="password"
+              value={pin}
+              onInput={(e) => setPin((e.target as HTMLInputElement).value)}
+              class="compact-input"
+            />
+          </label>
+
+          <button
+            type="button"
+            class="step-action-btn step-action-primary"
+            onClick={() => {
+              setShowHeaderMenu(false);
+              onClose();
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.82rem', color: 'var(--text-pinyin)' }}>
-              <span>{title || '未命名故事预览'}</span>
-              <span>
-                第 {previewPageIndex + 1} / {Math.max(1, sentences.length)} 页
-              </span>
-            </div>
-
-            <div class="reader-illustration-card" style={{ flex: 1, minHeight: '140px' }}>
-              {activePreviewImage ? (
-                <img src={activePreviewImage} alt="预览配图" class="story-image" />
-              ) : (
-                <div class="story-image-placeholder">
-                  <span style={{ fontSize: '2.2rem' }}>🖼️</span>
-                  <span style={{ fontSize: '0.9rem' }}>
-                    第 {previewPageIndex + 1} 页插画预览（未上传时发布将自动生成清新插画）
-                  </span>
-                </div>
-              )}
-            </div>
-
-            <SentenceDisplay
-              tokens={activePreviewTokens}
-              activeWordIndex={null}
-              activeTokenId={previewActiveTokenId}
-              showPinyinHint={previewShowPinyin}
-              onTokenClick={(tok) => {
-                setPreviewActiveTokenId(tok.id);
-                if (previewTimerRef.current !== null) {
-                  window.clearTimeout(previewTimerRef.current);
-                }
-                previewTimerRef.current = window.setTimeout(() => {
-                  setPreviewActiveTokenId(null);
-                  previewTimerRef.current = null;
-                }, PREVIEW_PINYIN_DURATION_MS);
-                void audioPlayer.playUrlOrFallback('', tok.character);
-              }}
-            />
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
-              <button
-                type="button"
-                class="btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-                disabled={previewPageIndex <= 0}
-                onClick={() => setPreviewPageIndex((p) => Math.max(0, p - 1))}
-              >
-                ◀ 上一页
-              </button>
-              <button
-                type="button"
-                class="btn-audio"
-                style={{ padding: '6px 14px', fontSize: '0.85rem' }}
-                onClick={() => void audioPlayer.playUrlOrFallback('', activePreviewSentence)}
-              >
-                🔊 试听整句
-              </button>
-              <button
-                type="button"
-                class="btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-                disabled={previewPageIndex >= Math.max(0, sentences.length - 1)}
-                onClick={() => setPreviewPageIndex((p) => Math.min(Math.max(0, sentences.length - 1), p + 1))}
-              >
-                下一页 ▶
-              </button>
-            </div>
-          </div>
+            ← 返回儿童阅读书架
+          </button>
         </div>
-      </aside>
+      </dialog>
     </div>
   );
 }

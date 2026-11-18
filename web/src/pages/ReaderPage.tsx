@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { ReadingSession, SentenceToken, StoryVersionDetail } from '../api/client';
+import { apiClient, ReadingSession, SentenceToken, StoryVersionDetail } from '../api/client';
 import { audioPlayer } from '../audio/player';
 import { SentenceDisplay } from '../components/SentenceDisplay';
 import {
@@ -20,6 +20,9 @@ function makeUUID(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
+// 拼音与词语提示持续显示 10.5 秒
+const PINYIN_DISPLAY_DURATION_MS = 10500;
+
 export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPageProps) {
   const [sentenceIndex, setSentenceIndex] = useState<number>(session.current_sentence_index || 0);
   const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
@@ -27,20 +30,62 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const [playingAudio, setPlayingAudio] = useState<boolean>(false);
   const [isImageFullscreen, setIsImageFullscreen] = useState<boolean>(false);
   const [isFinishedCelebration, setIsFinishedCelebration] = useState<boolean>(false);
+  const [localPinyinHint, setLocalPinyinHint] = useState<boolean>(showPinyinHint);
+  const [showSettingsSheet, setShowSettingsSheet] = useState<boolean>(false);
+
+  // 当前读者的复习字与新字集合（用于阅读页底色标记）
+  const [reviewCharSet, setReviewCharSet] = useState<Set<string>>(() => new Set());
+  const [newCharSet, setNewCharSet] = useState<Set<string>>(() => new Set());
 
   const viewIdRef = useRef<string>(makeUUID('sv'));
   const enteredAtIsoRef = useRef<string>(new Date().toISOString());
   const enteredAtPerfRef = useRef<number>(performance.now());
   const hiddenStartedAtRef = useRef<number | null>(null);
+  const lifecycleExitFlushedRef = useRef<boolean>(false);
   const visitedIndicesRef = useRef<Set<number>>(new Set([session.current_sentence_index || 0]));
   const highlightTimerRef = useRef<number | null>(null);
   const imageDialogRef = useRef<HTMLDialogElement | null>(null);
+  const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const charEventsRef = useRef<QueuedCharacterEvent[]>([]);
   const audioEventsRef = useRef<QueuedAudioEvent[]>([]);
   const visibilityEventsRef = useRef<QueuedVisibilityEvent[]>([]);
 
   const currentSentence = story.sentences[sentenceIndex] || story.sentences[0];
+  const totalSentences = Math.max(1, story.sentences.length);
+  const progressPct = Math.min(100, Math.max(5, Math.round(((sentenceIndex + 1) / totalSentences) * 100)));
+
+  useEffect(() => {
+    setLocalPinyinHint(showPinyinHint);
+  }, [showPinyinHint]);
+
+  // 静默拉取当前儿童的艾宾浩斯复习字与新字表，用于阅读页标记
+  useEffect(() => {
+    let cancelled = false;
+    if (!session.child_id) return;
+    apiClient
+      .getStoryPlan(session.child_id)
+      .then((plan) => {
+        if (cancelled || !plan) return;
+        const rev = new Set<string>();
+        const nw = new Set<string>();
+        plan.review_targets?.forEach((t) => rev.add(t.character));
+        plan.observe_targets?.forEach((t) => rev.add(t.character));
+        plan.new_candidates?.forEach((t) => {
+          if (!rev.has(t.character)) {
+            nw.add(t.character);
+          }
+        });
+        setReviewCharSet(rev);
+        setNewCharSet(nw);
+      })
+      .catch(() => {
+        // 离线或失败时静默降级
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session.child_id]);
 
   const flushCurrentSentenceView = async (
     nextIndex: number,
@@ -68,7 +113,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
             exited_at: exitedIso,
             total_elapsed_ms: totalElapsedMs,
             is_revisit: isRevisit,
-            client_version: '0.4.0'
+            client_version: '0.5.0'
           }
         ],
         character_events: [...charEventsRef.current],
@@ -93,6 +138,19 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   }, [isImageFullscreen]);
 
   useEffect(() => {
+    const dialog = settingsDialogRef.current;
+    if (!dialog) return;
+    if (showSettingsSheet) {
+      if (!dialog.open && typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [showSettingsSheet]);
+
+  useEffect(() => {
+    lifecycleExitFlushedRef.current = false;
     viewIdRef.current = makeUUID('sv');
     enteredAtIsoRef.current = new Date().toISOString();
     enteredAtPerfRef.current = performance.now();
@@ -107,27 +165,32 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       highlightTimerRef.current = null;
     }
 
-    // 预取当前句与单字 TTS 音频
+    // 预取当前句与单字 TTS 音频，实现点击零延迟发音
     if (currentSentence) {
       const punct = new Set(['，', '。', '！', '？', '、', '：', '；', '“', '”', '‘', '’', '（', '）']);
       const chars = currentSentence.tokens
         .map((t) => t.character)
         .filter((ch) => !punct.has(ch));
-      if (typeof (audioPlayer as any).prefetchTexts === 'function') {
-        (audioPlayer as any).prefetchTexts([currentSentence.text, ...chars]);
-      }
+      audioPlayer.prefetchTexts([currentSentence.text, ...chars]);
     }
 
-    // 静默预加载下一句插图，实现翻页零闪烁
+    // 静默预加载下一句插图
     const nextSentence = story.sentences[sentenceIndex + 1];
     if (nextSentence && nextSentence.image_url) {
       const preloadImg = new Image();
       preloadImg.src = nextSentence.image_url;
     }
 
+    const flushOnLifecycleExit = () => {
+      if (lifecycleExitFlushedRef.current) return;
+      lifecycleExitFlushedRef.current = true;
+      void flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
+    };
+
     const handleVisibilityChange = () => {
       const nowIso = new Date().toISOString();
       if (document.visibilityState === 'hidden') {
+        if (hiddenStartedAtRef.current !== null) return;
         hiddenStartedAtRef.current = performance.now();
         visibilityEventsRef.current.push({
           id: makeUUID('ve'),
@@ -136,10 +199,11 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
           occurred_at: nowIso,
           background_duration_ms: 0
         });
-        void flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
+        flushOnLifecycleExit();
       } else if (document.visibilityState === 'visible' && hiddenStartedAtRef.current !== null) {
         const bgMs = Math.max(0, Math.round(performance.now() - hiddenStartedAtRef.current));
         hiddenStartedAtRef.current = null;
+        lifecycleExitFlushedRef.current = false;
         visibilityEventsRef.current.push({
           id: makeUUID('ve'),
           sentence_view_id: viewIdRef.current,
@@ -150,12 +214,17 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       }
     };
 
+    const handlePageHide = flushOnLifecycleExit;
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
       if (highlightTimerRef.current !== null) {
         window.clearTimeout(highlightTimerRef.current);
       }
+      audioPlayer.stop();
     };
   }, [sentenceIndex]);
 
@@ -170,7 +239,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       setActiveWordIndex(null);
       setActiveToken(null);
       highlightTimerRef.current = null;
-    }, 1500);
+    }, PINYIN_DISPLAY_DURATION_MS);
 
     const clickedIso = new Date().toISOString();
     charEventsRef.current.push({
@@ -185,7 +254,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     await audioPlayer.playUrlOrFallback(token.audio_url, token.character);
   };
 
-  const handlePlaySentenceAudio = async () => {
+  const handlePlayWholeSentence = async () => {
     if (!currentSentence) return;
     setPlayingAudio(true);
     const playedIso = new Date().toISOString();
@@ -202,7 +271,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     });
   };
 
-  const handlePrev = async () => {
+  const handlePrevSentence = async () => {
     if (sentenceIndex <= 0) return;
     const prevIdx = sentenceIndex - 1;
     await flushCurrentSentenceView(prevIdx, 'active');
@@ -210,171 +279,254 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     setSentenceIndex(prevIdx);
   };
 
-  const handleNext = async () => {
+  const handleNextSentence = async () => {
     if (sentenceIndex < story.sentences.length - 1) {
       const nextIdx = sentenceIndex + 1;
       await flushCurrentSentenceView(nextIdx, 'active');
       visitedIndicesRef.current.add(nextIdx);
       setSentenceIndex(nextIdx);
     } else {
+      lifecycleExitFlushedRef.current = true;
       await flushCurrentSentenceView(sentenceIndex, 'completed', 'finished', true);
       setIsFinishedCelebration(true);
     }
   };
 
-  const handleUserExit = async () => {
-    await flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit', true);
+  const handleSaveAndExit = async () => {
+    lifecycleExitFlushedRef.current = true;
+    await flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit');
     onExit();
   };
 
-  if (!currentSentence) return null;
-
-  if (isFinishedCelebration) {
-    return (
-      <div
-        class="reader-stage"
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          minHeight: '65vh',
-          gap: '20px',
-          textAlign: 'center',
-          padding: '32px 16px'
-        }}
-      >
-        <div style={{ fontSize: '64px', lineHeight: 1 }}>🎉</div>
-        <h1 style={{ fontSize: '28px', margin: '8px 0' }}>读完《{story.title}》啦！</h1>
-        <p style={{ color: 'var(--text-pinyin)', fontSize: '16px', margin: 0 }}>
-          今日阅读记录与最新 10 分钟科学配比已自动同步！
-        </p>
-        <button
-          type="button"
-          class="btn-nav btn-primary btn-touch is-primary"
-          onClick={onExit}
-          style={{ minWidth: '180px', minHeight: '60px', fontSize: '20px', marginTop: '12px' }}
-        >
-          再选一本
-        </button>
-      </div>
-    );
+  if (!currentSentence) {
+    return null;
   }
 
-  return (
-    <div class="reader-stage">
-      <header class="reader-topbar">
-        <button type="button" class="btn-nav" onClick={handleUserExit}>
-          ← 返回书架
-        </button>
-        <div class="reader-title-group">
-          <h2>{story.title}</h2>
-          <span class="badge-mode">{session.mode === 'solo' ? '独立阅读' : '家长陪读'}</span>
-        </div>
-        <div class="reader-progress">
-          第 {sentenceIndex + 1} / {story.sentences.length} 页
-        </div>
-      </header>
+  const bgImageUrl = currentSentence.image_url || story.cover_url || '';
 
+  return (
+    <div class="reader-stage-immersive">
+      {/* 最底层：当前插图全屏高斯模糊氛围背景 */}
       <div
-        key={currentSentence.id}
-        class="reader-illustration-card story-card"
-        onClick={() => currentSentence.image_url && setIsImageFullscreen(true)}
-        style={{ cursor: currentSentence.image_url ? 'zoom-in' : 'default' }}
-        title={currentSentence.image_url ? '点击全屏查看插图' : ''}
-      >
-        {currentSentence.image_url ? (
-          <img
-            src={currentSentence.image_url}
-            alt={story.title}
-            class="story-image"
-            fetchpriority="high"
-            decoding="async"
-          />
-        ) : (
-          <div class="story-image-placeholder">
-            <span class="placeholder-icon">🏞️</span>
-            <span>{story.title} · 第 {sentenceIndex + 1} 幕插图</span>
+        class="reader-ambient-bg"
+        style={bgImageUrl ? { backgroundImage: `url("${bgImageUrl}")` } : undefined}
+        aria-hidden="true"
+      />
+      <div class="reader-ambient-scrim" aria-hidden="true" />
+
+      <div class="reader-stage">
+        {/* 极简顶部导航：左返回箭头 + 中间进度条 + 页码 + 右侧设置齿轮 */}
+        <header class="reader-topbar-minimal">
+          <button
+            type="button"
+            class="reader-icon-btn"
+            onClick={handleSaveAndExit}
+            aria-label="保存并返回书架"
+            title="保存并返回书架"
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M19 12H5" />
+              <path d="M12 19l-7-7 7-7" />
+            </svg>
+          </button>
+
+          <div class="reader-progress-track" role="progressbar" aria-valuenow={sentenceIndex + 1} aria-valuemin={1} aria-valuemax={totalSentences}>
+            <div class="reader-progress-fill" style={{ width: `${progressPct}%` }} />
           </div>
-        )}
+
+          <span class="reader-page-counter">
+            {sentenceIndex + 1} / {totalSentences}
+          </span>
+
+          <button
+            type="button"
+            class="reader-icon-btn"
+            onClick={() => setShowSettingsSheet(true)}
+            aria-label="阅读设置"
+            title="阅读设置"
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        </header>
+
+        {/* 紧凑型插图区：约占屏幕 1/4 高度，保证下方整句话一屏内完整显示 */}
+        <div key={currentSentence.id} class="reader-illustration-compact">
+          {currentSentence.image_url ? (
+            <img
+              src={currentSentence.image_url}
+              alt={story.title}
+              class="story-image"
+              fetchpriority="high"
+              style={{ cursor: 'zoom-in' }}
+              title="点击放大查看插图"
+              onClick={() => setIsImageFullscreen(true)}
+            />
+          ) : (
+            <div class="story-image-placeholder">
+              <span>插图（第 {sentenceIndex + 1} 页 · {story.title}）</span>
+            </div>
+          )}
+        </div>
+
+        {/* 毛玻璃文字卡片：按词语换行 + 复习字/新字高亮 + 点一下出拼音 */}
+        <SentenceDisplay
+          tokens={currentSentence.tokens}
+          activeWordIndex={activeWordIndex}
+          activeTokenId={activeToken?.id || null}
+          showPinyinHint={localPinyinHint}
+          reviewChars={reviewCharSet}
+          newChars={newCharSet}
+          showLegend={true}
+          onTokenClick={handleTokenClick}
+        />
+
+        {/* 底部操控栏：左白框上一页 + 中间圆形喇叭 + 右黑底下一页 */}
+        <footer class="reader-controls-modern">
+          <button
+            type="button"
+            class="btn-page-prev"
+            disabled={sentenceIndex === 0}
+            onClick={handlePrevSentence}
+          >
+            ‹ 上一页
+          </button>
+
+          <button
+            type="button"
+            class={`btn-audio-circle ${playingAudio ? 'is-playing' : ''}`}
+            onClick={handlePlayWholeSentence}
+            disabled={playingAudio}
+            aria-label={playingAudio ? '正在朗读整句' : '听整句朗读'}
+            title="听整句朗读"
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+            </svg>
+          </button>
+
+          <button
+            type="button"
+            class="btn-page-next"
+            onClick={handleNextSentence}
+          >
+            {sentenceIndex < story.sentences.length - 1 ? '下一页 ›' : '读完啦 ›'}
+          </button>
+        </footer>
       </div>
 
+      {/* 原生 HTML <dialog> 全屏插图查看器 */}
       <dialog
         ref={imageDialogRef}
-        onClose={() => setIsImageFullscreen(false)}
-        onClick={(e) => {
-          if (e.target === imageDialogRef.current) {
-            setIsImageFullscreen(false);
-          }
-        }}
-        style={{
-          padding: '16px',
-          border: 'none',
-          borderRadius: '20px',
-          background: 'rgba(18, 22, 27, 0.94)',
-          maxWidth: '94vw',
-          maxHeight: '92dvh',
-          cursor: 'zoom-out'
-        }}
+        class="fullscreen-image-dialog"
+        onClick={() => setIsImageFullscreen(false)}
+        onCancel={() => setIsImageFullscreen(false)}
       >
         {currentSentence.image_url && (
-          <img
-            src={currentSentence.image_url}
-            alt={story.title}
-            onClick={() => setIsImageFullscreen(false)}
-            style={{
-              maxWidth: '88vw',
-              maxHeight: '84dvh',
-              objectFit: 'contain',
-              borderRadius: '14px',
-              display: 'block'
-            }}
-          />
+          <div class="dialog-image-wrapper">
+            <img
+              src={currentSentence.image_url}
+              alt={story.title}
+              class="dialog-fullscreen-img"
+            />
+            <span class="dialog-close-hint">点击任意位置返回阅读</span>
+          </div>
         )}
       </dialog>
 
-      <SentenceDisplay
-        tokens={currentSentence.tokens}
-        activeWordIndex={activeWordIndex}
-        activeTokenId={activeToken?.id || null}
-        showPinyinHint={showPinyinHint}
-        onTokenClick={handleTokenClick}
-      />
+      {/* 原生 HTML <dialog> 阅读设置弹窗 */}
+      <dialog
+        ref={settingsDialogRef}
+        class="reader-settings-dialog"
+        onClick={(e) => {
+          if (e.target === settingsDialogRef.current) {
+            setShowSettingsSheet(false);
+          }
+        }}
+        onCancel={() => setShowSettingsSheet(false)}
+      >
+        <div class="reader-settings-sheet">
+          <div class="settings-sheet-header">
+            <strong>阅读设置 · 《{story.title}》</strong>
+            <button
+              type="button"
+              class="reader-icon-btn"
+              onClick={() => setShowSettingsSheet(false)}
+              aria-label="关闭设置"
+            >
+              ✕
+            </button>
+          </div>
+          <label class="settings-sheet-row">
+            <span>常驻显示全句拼音</span>
+            <input
+              type="checkbox"
+              checked={localPinyinHint}
+              onChange={(e) => setLocalPinyinHint((e.target as HTMLInputElement).checked)}
+            />
+          </label>
+          <div class="settings-sheet-row">
+            <span>当前阅读模式</span>
+            <span>{session.mode === 'accompanied' ? '👨‍👧 家长陪读' : '🧒 独立阅读'}</span>
+          </div>
+          <div class="settings-sheet-actions">
+            <button
+              type="button"
+              class="btn-page-prev"
+              onClick={() => {
+                setShowSettingsSheet(false);
+                void handleSaveAndExit();
+              }}
+            >
+              保存进度并返回书架
+            </button>
+          </div>
+        </div>
+      </dialog>
 
-      {activeToken && (
-        <div class="help-feedback-banner" aria-live="polite">
-          <span>
-            点字发音：<strong>{activeToken.character}</strong>（<strong>{activeToken.pinyin}</strong>）
-          </span>
-          <span>
-            所属词语：<strong>{activeToken.word}</strong>
-          </span>
+      {/* 读完本篇庆祝激励弹窗 */}
+      {isFinishedCelebration && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="阅读完成庆祝"
+          class="celebration-backdrop"
+        >
+          <div class="celebration-card">
+            <div style={{ fontSize: '56px', lineHeight: 1 }}>🎉🌟🏆</div>
+            <h2>太棒啦！读完《{story.title}》！</h2>
+            <p>
+              共坚持读完 <strong>{story.sentences.length}</strong> 页故事，今天又是爱阅读的一天！
+            </p>
+            <div class="celebration-actions">
+              <button
+                type="button"
+                class="btn-page-prev"
+                onClick={() => {
+                  setIsFinishedCelebration(false);
+                  setSentenceIndex(0);
+                }}
+              >
+                再读一遍
+              </button>
+              <button
+                type="button"
+                class="btn-page-next"
+                onClick={() => {
+                  setIsFinishedCelebration(false);
+                  onExit();
+                }}
+              >
+                返回书架
+              </button>
+            </div>
+          </div>
         </div>
       )}
-
-      <footer class="reader-controls">
-        <button
-          type="button"
-          class="btn-nav"
-          disabled={sentenceIndex === 0}
-          onClick={handlePrev}
-        >
-          上一句
-        </button>
-
-        <button
-          type="button"
-          class="btn-audio"
-          onClick={handlePlaySentenceAudio}
-          disabled={playingAudio}
-        >
-          🔊 {playingAudio ? '正在朗读...' : '整句朗读'}
-        </button>
-
-        <button type="button" class="btn-nav btn-primary" onClick={handleNext}>
-          {sentenceIndex === story.sentences.length - 1 ? '读完啦 🎉' : '下一句 →'}
-        </button>
-      </footer>
     </div>
   );
 }
