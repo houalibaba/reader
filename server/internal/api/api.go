@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,14 +32,17 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Config
-	db       *sql.DB
-	events   *events.Service
-	importer *content.Importer
-	jobs     *jobs.Runner
-	media    *media.Handler
-	webFS    fs.FS
-	updater  *updater.Updater
+	cfg                     *config.Config
+	db                      *sql.DB
+	events                  *events.Service
+	importer                *content.Importer
+	jobs                    *jobs.Runner
+	media                   *media.Handler
+	webFS                   fs.FS
+	updater                 *updater.Updater
+	gistAPIBaseURL          string
+	gistRawBaseURL          string
+	allowLoopbackImageFetch bool
 }
 
 func NewServer(cfg *config.Config, dbConn *sql.DB, webFS fs.FS) *Server {
@@ -71,6 +75,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/v1/admin/import", s.requireGuardianPIN(s.handleAdminImport))
 	mux.HandleFunc("/api/v1/admin/quick-story", s.requireGuardianPIN(s.handleAdminQuickStory))
 	mux.HandleFunc("/api/v1/admin/auto-generate-story", s.requireGuardianPIN(s.handleAdminAutoGenerateStory))
+	mux.HandleFunc("/api/v1/admin/gist-pull", s.requireGuardianPIN(s.handleAdminGistPull))
 	mux.HandleFunc("/api/v1/admin/export", s.requireGuardianPIN(s.handleAdminExport))
 	mux.HandleFunc("/api/v1/admin/events/", s.requireGuardianPIN(s.handleAdminEventValidity))
 	mux.HandleFunc("/api/v1/admin/stories/", s.requireGuardianPIN(s.handleAdminDeleteStory))
@@ -113,11 +118,15 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func (s *Server) requireGuardianPIN(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		pin := r.Header.Get("X-Guardian-Pin")
+		pin := strings.TrimSpace(r.Header.Get("X-Guardian-Pin"))
 		if pin == "" {
-			pin = r.URL.Query().Get("pin")
+			pin = strings.TrimSpace(r.URL.Query().Get("pin"))
 		}
-		if s.cfg.GuardianPin != "" && pin != s.cfg.GuardianPin {
+		expectedPin := ""
+		if s.cfg != nil {
+			expectedPin = strings.TrimSpace(s.cfg.GuardianPin)
+		}
+		if expectedPin == "" || pin != expectedPin {
 			writeError(w, http.StatusUnauthorized, "invalid guardian PIN")
 			return
 		}
@@ -679,7 +688,7 @@ func (s *Server) handleAdminDeleteStory(w http.ResponseWriter, r *http.Request) 
 		trimmed = strings.TrimPrefix(r.URL.Path, "/api/v1/stories/")
 	}
 	storyID := strings.Trim(trimmed, "/")
-	if storyID == "" || strings.Contains(storyID, "/") {
+	if err := content.ValidateSafeIdentifier("story_id", storyID); err != nil {
 		writeError(w, http.StatusBadRequest, "valid story_id required")
 		return
 	}
@@ -759,8 +768,12 @@ func (s *Server) handleAdminQuickStory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "title and raw_text are required")
 		return
 	}
+	req.StoryID = strings.TrimSpace(req.StoryID)
 	if req.StoryID == "" {
 		req.StoryID = newID("story")
+	} else if err := content.ValidateSafeIdentifier("story_id", req.StoryID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if req.Theme == "" {
 		req.Theme = "勇气与探索（森林过河）"
@@ -779,13 +792,36 @@ func (s *Server) handleAdminQuickStory(w http.ResponseWriter, r *http.Request) {
 
 	var imageURLs []string
 	if len(req.CustomImages) > 0 {
-		imageURLs, _ = content.SaveUserPreparedImages(s.cfg.MediaDir(), req.StoryID, versionID, req.CustomImages, len(rawSentences))
+		var saveErr error
+		imageURLs, saveErr = content.SaveUserPreparedImages(s.cfg.MediaDir(), req.StoryID, versionID, req.CustomImages, len(rawSentences))
+		if saveErr != nil {
+			writeError(w, http.StatusBadRequest, saveErr.Error())
+			return
+		}
 	}
-	if len(imageURLs) == 0 {
-		imageURLs, _ = content.RenderStoryIllustrations(
+	needsFallback := len(imageURLs) == 0
+	if !needsFallback {
+		for _, u := range imageURLs {
+			if strings.TrimSpace(u) == "" {
+				needsFallback = true
+				break
+			}
+		}
+	}
+	if needsFallback {
+		fallbackURLs, _ := content.RenderStoryIllustrations(
 			r.Context(), s.cfg.MediaDir(), req.StoryID, versionID, req.Theme, rawSentences,
 			req.ImageAPIURL, req.ImageAPIKey, req.ImageModel,
 		)
+		if len(imageURLs) == 0 {
+			imageURLs = fallbackURLs
+		} else {
+			for idx := range imageURLs {
+				if strings.TrimSpace(imageURLs[idx]) == "" && idx < len(fallbackURLs) {
+					imageURLs[idx] = fallbackURLs[idx]
+				}
+			}
+		}
 	}
 
 	var sentences []content.SentenceManifest
@@ -1409,6 +1445,25 @@ type gistStoryPayload struct {
 	Images      []string `json:"images"`
 }
 
+type gistImportResult struct {
+	Status            string   `json:"status"` // "imported" or "already_imported"
+	Version           string   `json:"version"`
+	ImportedStoryID   string   `json:"imported_story_id,omitempty"`
+	ImportedVersionID string   `json:"imported_version_id,omitempty"`
+	VersionNumber     int      `json:"version_number,omitempty"`
+	Title             string   `json:"title"`
+	Theme             string   `json:"theme"`
+	Description       string   `json:"description"`
+	RawText           string   `json:"raw_text"`
+	Sentences         []string `json:"sentences"`
+	SentenceCount     int      `json:"sentence_count"`
+	ImageCount        int      `json:"image_count"`
+	LinesPerImage     string   `json:"lines_per_image"`
+	CoverURL          string   `json:"cover_url,omitempty"`
+	ImageURLs         []string `json:"image_urls,omitempty"`
+	Source            string   `json:"source"`
+}
+
 func extractMetaField(content, fieldName string) string {
 	prefix := fieldName + ":"
 	for _, line := range strings.Split(content, "\n") {
@@ -1420,71 +1475,241 @@ func extractMetaField(content, fieldName string) string {
 	return ""
 }
 
-// fetchAndImportLatestStoryFromGist 从固定 Gist 拉取新故事（优先读 next_story.json，回退读 next_prompt.md），按 version 判重后自动下载 4 张章节配图并入库
-func (s *Server) fetchAndImportLatestStoryFromGist() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+func parseGistStoryContent(contentStr string) (gistStoryPayload, bool) {
+	contentStr = strings.TrimSpace(contentStr)
+	if contentStr == "" {
+		return gistStoryPayload{}, false
+	}
+	metaVer := extractMetaField(contentStr, "version")
 
-	candidates := []string{
-		"https://gist.githubusercontent.com/houalibaba/aa8591c33578eb903d881cd133ec8fc3/raw/next_story.json",
-		"https://gist.githubusercontent.com/houalibaba/aa8591c33578eb903d881cd133ec8fc3/raw/next_prompt.md",
+	jsonPart := contentStr
+	if idx := strings.Index(jsonPart, "-->"); idx >= 0 {
+		jsonPart = strings.TrimSpace(jsonPart[idx+3:])
+	}
+	if startIdx := strings.Index(jsonPart, "{"); startIdx >= 0 {
+		if endIdx := strings.LastIndex(jsonPart, "}"); endIdx > startIdx {
+			jsonPart = jsonPart[startIdx : endIdx+1]
+		}
+	}
+
+	var p gistStoryPayload
+	if err := json.Unmarshal([]byte(jsonPart), &p); err == nil {
+		if p.Version == "" {
+			p.Version = metaVer
+		}
+		if strings.TrimSpace(p.Title) != "" && (len(p.Sentences) > 0 || strings.TrimSpace(p.RawText) != "") {
+			return p, true
+		}
+	}
+	return gistStoryPayload{}, false
+}
+
+// isBlockedOrPrivateIP checks whether an IP address belongs to loopback, link-local, RFC1918 private,
+// CGNAT (100.64.0.0/10, including Tailscale), cloud metadata (169.254.169.254), IPv6 ULA (fc00::/7), or multicast ranges.
+func isBlockedOrPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 100.64.0.0/10 (Carrier-Grade NAT / Tailscale)
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+		// 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, >=224.0.0.0
+		if ip4[0] == 0 || ip4[0] == 127 || (ip4[0] == 169 && ip4[1] == 254) || ip4[0] >= 224 {
+			return true
+		}
+		return false
+	}
+	// IPv6 Unique Local Addresses fc00::/7
+	if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
+		return true
+	}
+	return false
+}
+
+func validatePublicRemoteImageURL(rawURL string, allowLoopback bool) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, fmt.Errorf("invalid image url: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if !allowLoopback {
+		if scheme != "https" {
+			return nil, fmt.Errorf("disallowed image url scheme %q (only https allowed)", parsed.Scheme)
+		}
+	} else if scheme != "https" && scheme != "http" {
+		return nil, fmt.Errorf("disallowed image url scheme %q", parsed.Scheme)
+	}
+	if parsed.User != nil {
+		return nil, errors.New("credentials in image url are not allowed")
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return nil, errors.New("empty host in image url")
+	}
+	if !allowLoopback {
+		if host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".internal") {
+			return nil, fmt.Errorf("disallowed local host %q", host)
+		}
+		if ip := net.ParseIP(host); ip != nil && isBlockedOrPrivateIP(ip) {
+			return nil, fmt.Errorf("disallowed private or loopback IP %s", ip.String())
+		}
+	}
+	return parsed, nil
+}
+
+// newSSRFProtectedImageClient creates an HTTP client that verifies DNS-resolved IPs at dial time
+// and re-validates every redirect target to prevent SSRF and DNS rebinding attacks.
+func (s *Server) newSSRFProtectedImageClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("no IP addresses resolved for %s", host)
+			}
+			for _, ipAddr := range ips {
+				if !s.allowLoopbackImageFetch && isBlockedOrPrivateIP(ipAddr.IP) {
+					return nil, fmt.Errorf("ssrf blocked: host %s resolved to non-public IP %s", host, ipAddr.IP.String())
+				}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	}
+	return &http.Client{
+		Timeout:   25 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many redirects when fetching image")
+			}
+			_, err := validatePublicRemoteImageURL(req.URL.String(), s.allowLoopbackImageFetch)
+			return err
+		},
+	}
+}
+
+// pullAndImportStoryFromGist 优先通过零 CDN 缓存的 GitHub Gist API (https://api.github.com/gists/<id>) 读取新故事与配图，
+// 严格校验 story_id 与外部图片 URL（防路径穿越与 SSRF），并按图片数与总行数公式 idx*len(images)/len(sentences) 将每张图平均分配绑定到多行故事内容。
+func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport bool) (*gistImportResult, error) {
+	const gistID = "aa8591c33578eb903d881cd133ec8fc3"
+	githubToken := strings.TrimSpace(os.Getenv("GITHUB_GIST_TOKEN"))
+
+	apiBase := strings.TrimRight(strings.TrimSpace(s.gistAPIBaseURL), "/")
+	if apiBase == "" {
+		apiBase = "https://api.github.com"
+	}
+	rawBase := strings.TrimRight(strings.TrimSpace(s.gistRawBaseURL), "/")
+	if rawBase == "" {
+		rawBase = "https://gist.githubusercontent.com/houalibaba/" + gistID + "/raw"
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	var payload gistStoryPayload
 	var parsedOK bool
+	var sourceUsed string
+	var gistSiblingFiles map[string]struct {
+		Content string `json:"content"`
+		RawURL  string `json:"raw_url"`
+	}
 
-	for _, rawURL := range candidates {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?t=%d", rawURL, time.Now().Unix()), nil)
-		if err != nil {
-			continue
+	// 1. 优先请求 GitHub Gist API 端点（零 CDN 缓存，实时获取最新文件内容）
+	apiURL := fmt.Sprintf("%s/gists/%s?t=%d", apiBase, gistID, time.Now().UnixNano())
+	if apiReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil); err == nil {
+		apiReq.Header.Set("Accept", "application/vnd.github+json")
+		apiReq.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
+		apiReq.Header.Set("Pragma", "no-cache")
+		apiReq.Header.Set("User-Agent", "reader-gist-sync/1.0")
+		if githubToken != "" {
+			apiReq.Header.Set("Authorization", "Bearer "+githubToken)
 		}
-		req.Header.Set("User-Agent", "reader-gist-sync/1.0")
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-		_ = resp.Body.Close()
-		if readErr != nil || resp.StatusCode != http.StatusOK || len(bodyBytes) == 0 {
-			continue
-		}
-
-		contentStr := strings.TrimSpace(string(bodyBytes))
-		metaVer := extractMetaField(contentStr, "version")
-
-		jsonPart := contentStr
-		if idx := strings.Index(jsonPart, "-->"); idx >= 0 {
-			jsonPart = strings.TrimSpace(jsonPart[idx+3:])
-		}
-		if startIdx := strings.Index(jsonPart, "{"); startIdx >= 0 {
-			if endIdx := strings.LastIndex(jsonPart, "}"); endIdx > startIdx {
-				jsonPart = jsonPart[startIdx : endIdx+1]
+		if resp, err := client.Do(apiReq); err == nil {
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+			_ = resp.Body.Close()
+			if readErr == nil && resp.StatusCode == http.StatusOK && len(bodyBytes) > 0 {
+				var gistObj struct {
+					Files map[string]struct {
+						Content string `json:"content"`
+						RawURL  string `json:"raw_url"`
+					} `json:"files"`
+				}
+				if err := json.Unmarshal(bodyBytes, &gistObj); err == nil && len(gistObj.Files) > 0 {
+					gistSiblingFiles = gistObj.Files
+					candidateNames := []string{"next_story.json"}
+					for fname := range gistObj.Files {
+						if fname != "next_story.json" && strings.HasSuffix(strings.ToLower(fname), ".json") {
+							candidateNames = append(candidateNames, fname)
+						}
+					}
+					candidateNames = append(candidateNames, "next_prompt.md")
+					for _, fname := range candidateNames {
+						if f, ok := gistObj.Files[fname]; ok && strings.TrimSpace(f.Content) != "" {
+							if p, ok := parseGistStoryContent(f.Content); ok {
+								payload = p
+								parsedOK = true
+								sourceUsed = "github_api:" + fname
+								break
+							}
+						}
+					}
+				}
 			}
 		}
+	}
 
-		var p gistStoryPayload
-		if err := json.Unmarshal([]byte(jsonPart), &p); err == nil {
-			if p.Version == "" {
-				p.Version = metaVer
+	// 2. 若 GitHub API 未命中或受限，回退到带纳秒时间戳与禁缓存 Header 的 Raw 链接
+	if !parsedOK {
+		candidates := []string{
+			rawBase + "/next_story.json",
+			rawBase + "/next_prompt.md",
+		}
+		for _, rawURL := range candidates {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?t=%d", rawURL, time.Now().UnixNano()), nil)
+			if err != nil {
+				continue
 			}
-			if p.Title != "" && (len(p.Sentences) > 0 || strings.TrimSpace(p.RawText) != "") {
+			req.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
+			req.Header.Set("Pragma", "no-cache")
+			req.Header.Set("User-Agent", "reader-gist-sync/1.0")
+			resp, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+			_ = resp.Body.Close()
+			if readErr != nil || resp.StatusCode != http.StatusOK || len(bodyBytes) == 0 {
+				continue
+			}
+			if p, ok := parseGistStoryContent(string(bodyBytes)); ok {
 				payload = p
 				parsedOK = true
+				sourceUsed = "raw_nocache:" + filepath.Base(rawURL)
 				break
 			}
 		}
 	}
 
-	if !parsedOK || strings.TrimSpace(payload.Version) == "" {
-		return
+	if !parsedOK {
+		return nil, errors.New("Gist 中暂未找到有效的新故事 JSON（请确认 Gist 中已上传包含 title 与 sentences/raw_text 的 next_story.json）")
 	}
 
-	versionTag := "[GistVersion:" + strings.TrimSpace(payload.Version) + "]"
-	var exists int
-	_ = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM stories WHERE description LIKE ?", "%"+versionTag+"%").Scan(&exists)
-	if exists > 0 {
-		return // 该版本已入库，跳过避免重复
+	// 严格验证 Gist 传入的 story_id，拒绝任何路径穿越字符（如 ../ 或 /）
+	storyID := strings.TrimSpace(payload.StoryID)
+	if storyID == "" {
+		storyID = newID("story")
+	} else if err := content.ValidateSafeIdentifier("story_id", storyID); err != nil {
+		return nil, fmt.Errorf("invalid story_id in gist payload: %w", err)
 	}
 
 	rawSentences := payload.Sentences
@@ -1492,7 +1717,55 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 		rawSentences = content.SplitSentences(payload.RawText)
 	}
 	if len(rawSentences) == 0 {
-		return
+		return nil, errors.New("Gist 故事内容中没有解析到有效句子")
+	}
+
+	verStr := strings.TrimSpace(payload.Version)
+	if verStr == "" {
+		verStr = time.Now().In(time.FixedZone("CST", 8*3600)).Format("20060102150405")
+	}
+	versionTag := "[GistVersion:" + verStr + "]"
+
+	if !forceImport {
+		var existingID, existingTitle, existingVersionID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT s.id, s.title, COALESCE(
+				(SELECT sv.id FROM story_versions sv WHERE sv.story_id = s.id AND sv.status = 'published' ORDER BY sv.version_number DESC LIMIT 1),
+				''
+			)
+			FROM stories s
+			WHERE s.description LIKE ? AND s.status != 'deleted'
+			LIMIT 1
+		`, "%"+versionTag+"%").Scan(&existingID, &existingTitle, &existingVersionID)
+		if err == nil && existingID != "" {
+			var existingImageURLs []string
+			if existingVersionID != "" {
+				rows, qErr := s.db.QueryContext(ctx, "SELECT COALESCE(image_url, '') FROM story_sentences WHERE version_id = ? ORDER BY sequence_index ASC", existingVersionID)
+				if qErr == nil {
+					for rows.Next() {
+						var iu string
+						if rows.Scan(&iu) == nil {
+							existingImageURLs = append(existingImageURLs, iu)
+						}
+					}
+					_ = rows.Close()
+				}
+			}
+			return &gistImportResult{
+				Status:            "already_imported",
+				Version:           verStr,
+				ImportedStoryID:   existingID,
+				ImportedVersionID: existingVersionID,
+				Title:             existingTitle,
+				Theme:             payload.Theme,
+				Description:       payload.Description,
+				RawText:           strings.Join(rawSentences, "\n"),
+				Sentences:         rawSentences,
+				SentenceCount:     len(rawSentences),
+				ImageURLs:         existingImageURLs,
+				Source:            sourceUsed,
+			}, nil
+		}
 	}
 
 	imgLinks := payload.ImageURLs
@@ -1500,10 +1773,6 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 		imgLinks = payload.Images
 	}
 
-	storyID := strings.TrimSpace(payload.StoryID)
-	if storyID == "" {
-		storyID = newID("story")
-	}
 	theme := strings.TrimSpace(payload.Theme)
 	if theme == "" {
 		theme = "我的世界·故事模式"
@@ -1514,7 +1783,8 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 	nextVer := maxVer + 1
 	versionID := fmt.Sprintf("%s_v%d", storyID, nextVer)
 
-	// 下载 Gist 传入的 4 张章节配图（兼容 http/https URL、DataURL 或纯 Base64），交由 SaveUserPreparedImages 自动均匀映射到各句
+	// 使用带 SSRF 防护的 HTTP Client 下载外部章节配图（仅允许公网 HTTPS，禁止访问内网/环回/链路本地 IP）
+	imgClient := s.newSSRFProtectedImageClient()
 	var customImages []content.CustomImageUpload
 	for idx, rawImg := range imgLinks {
 		u := strings.TrimSpace(rawImg)
@@ -1524,18 +1794,32 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 		fname := fmt.Sprintf("chapter_%02d.webp", idx)
 		var b64Data string
 
-		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-			if parsedU, err := url.Parse(u); err == nil {
-				if ext := strings.ToLower(filepath.Ext(parsedU.Path)); ext != "" {
-					fname = fmt.Sprintf("chapter_%02d%s", idx, ext)
+		// 若传入的是同 Gist 下的文件名（如 "chapter_01.png"），优先从 Gist API 返回的 files 中提取
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "data:") && gistSiblingFiles != nil {
+			if sib, exists := gistSiblingFiles[u]; exists {
+				if strings.TrimSpace(sib.RawURL) != "" {
+					u = strings.TrimSpace(sib.RawURL)
+				} else if strings.TrimSpace(sib.Content) != "" {
+					u = strings.TrimSpace(sib.Content)
 				}
 			}
-			imgReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		}
+
+		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			parsedU, err := validatePublicRemoteImageURL(u, s.allowLoopbackImageFetch)
 			if err != nil {
 				continue
 			}
+			if ext := strings.ToLower(filepath.Ext(parsedU.Path)); ext != "" {
+				fname = fmt.Sprintf("chapter_%02d%s", idx, ext)
+			}
+			imgReq, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedU.String(), nil)
+			if err != nil {
+				continue
+			}
+			imgReq.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
 			imgReq.Header.Set("User-Agent", "reader-gist-sync/1.0")
-			imgResp, err := client.Do(imgReq)
+			imgResp, err := imgClient.Do(imgReq)
 			if err != nil {
 				continue
 			}
@@ -1563,7 +1847,11 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 
 	var imageURLs []string
 	if len(customImages) > 0 {
-		imageURLs, _ = content.SaveUserPreparedImages(s.cfg.MediaDir(), storyID, versionID, customImages, len(rawSentences))
+		var saveErr error
+		imageURLs, saveErr = content.SaveUserPreparedImages(s.cfg.MediaDir(), storyID, versionID, customImages, len(rawSentences))
+		if saveErr != nil {
+			return nil, saveErr
+		}
 	}
 	if len(imageURLs) == 0 {
 		imageURLs, _ = content.RenderStoryIllustrations(
@@ -1595,7 +1883,7 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 
 	desc := strings.TrimSpace(payload.Description)
 	if desc == "" {
-		desc = fmt.Sprintf("主题【%s】· 每日凌晨自动同步故事 %s", theme, versionTag)
+		desc = fmt.Sprintf("主题【%s】· Gist 同步故事 %s", theme, versionTag)
 	} else if !strings.Contains(desc, versionTag) {
 		desc = desc + " " + versionTag
 	}
@@ -1613,9 +1901,67 @@ func (s *Server) fetchAndImportLatestStoryFromGist() {
 	}
 
 	if err := s.importer.SaveManifest(ctx, manifest); err != nil {
-		return
+		return nil, err
 	}
 	go s.precacheStoryVersionAudio(manifest.VersionID)
+
+	imgCount := len(customImages)
+	if imgCount == 0 {
+		imgCount = len(imageURLs)
+	}
+	linesRatio := fmt.Sprintf("共 %d 行", len(rawSentences))
+	if imgCount > 0 {
+		avgLines := float64(len(rawSentences)) / float64(imgCount)
+		linesRatio = fmt.Sprintf("%d 张图平均分配 %d 行（每张图约 %.1f 行）", imgCount, len(rawSentences), avgLines)
+	}
+
+	return &gistImportResult{
+		Status:            "imported",
+		Version:           verStr,
+		ImportedStoryID:   manifest.StoryID,
+		ImportedVersionID: manifest.VersionID,
+		VersionNumber:     manifest.VersionNumber,
+		Title:             manifest.Title,
+		Theme:             manifest.Theme,
+		Description:       manifest.Description,
+		RawText:           strings.Join(rawSentences, "\n"),
+		Sentences:         rawSentences,
+		SentenceCount:     len(manifest.Sentences),
+		ImageCount:        imgCount,
+		LinesPerImage:     linesRatio,
+		CoverURL:          coverURL,
+		ImageURLs:         imageURLs,
+		Source:            sourceUsed,
+	}, nil
+}
+
+// fetchAndImportLatestStoryFromGist 供每天凌晨 3 点定时任务调用
+func (s *Server) fetchAndImportLatestStoryFromGist() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, _ = s.pullAndImportStoryFromGist(ctx, false)
+}
+
+// POST /api/v1/admin/gist-pull 手动从 GitHub Gist 零缓存拉取最新故事与配图并按行数平均分配绑定入库
+func (s *Server) handleAdminGistPull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Force bool `json:"force"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	res, err := s.pullAndImportStoryFromGist(ctx, req.Force)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {

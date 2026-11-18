@@ -237,15 +237,41 @@ func NewImporter(db *sql.DB, mediaDir, tmpDir string) *Importer {
 	}
 }
 
+// ValidateSafeIdentifier ensures story_id / version_id / child_id contains only safe ASCII [a-zA-Z0-9_-]
+// and never allows path separators, "..", or hidden files.
+func ValidateSafeIdentifier(field, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("missing %s", field)
+	}
+	if len(id) > 96 {
+		return fmt.Errorf("%s exceeds maximum length (96)", field)
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '_' && c != '-' {
+			return fmt.Errorf("invalid %s %q: only [a-zA-Z0-9_-] allowed", field, id)
+		}
+	}
+	return nil
+}
+
 func ValidateManifest(m *StoryManifest) error {
 	if strings.TrimSpace(m.StoryID) == "" {
 		return errors.New("manifest missing story_id")
+	}
+	if err := ValidateSafeIdentifier("story_id", m.StoryID); err != nil {
+		return err
 	}
 	if strings.TrimSpace(m.Title) == "" {
 		return errors.New("manifest missing title")
 	}
 	if strings.TrimSpace(m.VersionID) == "" {
 		return errors.New("manifest missing version_id")
+	}
+	if err := ValidateSafeIdentifier("version_id", m.VersionID); err != nil {
+		return err
 	}
 	if m.VersionNumber <= 0 {
 		return errors.New("manifest version_number must be >= 1")

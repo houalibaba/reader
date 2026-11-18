@@ -94,6 +94,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Update.Repo == "" {
 		cfg.Update.Repo = "houalibaba/Reader"
 	}
+	if strings.TrimSpace(cfg.GuardianPin) == "" {
+		cfg.GuardianPin = "1234"
+	}
 	return cfg, nil
 }
 
