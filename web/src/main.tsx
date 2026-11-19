@@ -1,5 +1,5 @@
 import { render } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   apiClient,
   ChildProfile,
@@ -10,6 +10,12 @@ import {
 import { GuardianPage } from './pages/GuardianPage';
 import { ReaderPage } from './pages/ReaderPage';
 import { eventQueue } from './queue/offlineQueue';
+import {
+  buildStoryRewardAnimation,
+  getUnlockedStoryIdSet,
+  sortStoriesNewestFirst,
+  StoryRewardAnimation
+} from './utils/rewardAnimation';
 import './styles.css';
 import './reader-theme.css';
 import './admin-theme.css';
@@ -28,15 +34,36 @@ export function App() {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [openingStoryId, setOpeningStoryId] = useState<string | null>(null);
 
+  // 1 对 1 专属动画播放弹窗（仅在故事卡片上对该篇已解锁动画展示入口）
+  const [playingStoryAnim, setPlayingStoryAnim] = useState<StoryRewardAnimation | null>(null);
+  const animDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  const sortedStories = useMemo(() => sortStoriesNewestFirst(stories), [stories]);
+  const unlockedStoryIds = useMemo(
+    () => getUnlockedStoryIdSet(activeChild?.id),
+    [activeChild?.id, stories, activeSession]
+  );
+
   useEffect(() => {
     document.body.dataset.mode = showGuardian ? 'admin' : 'reader';
   }, [showGuardian]);
+
+  useEffect(() => {
+    const dialog = animDialogRef.current;
+    if (!dialog) return;
+    if (playingStoryAnim) {
+      if (!dialog.open && typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [playingStoryAnim]);
 
   const loadInitialData = async (selectedChildId?: string) => {
     try {
       setErrorMsg('');
       let kids = await apiClient.listChildren();
-      // Auto-initialize a default child profile on fresh install so "开始阅读" works immediately
       if (kids.length === 0) {
         const defaultChild = await apiClient.createChild({
           name: '六六',
@@ -50,7 +77,7 @@ export function App() {
       setActiveChild(current);
 
       const storyList = await apiClient.listStories(current?.id);
-      setStories(storyList);
+      setStories(sortStoriesNewestFirst(storyList));
     } catch (err: any) {
       setErrorMsg(`无法加载书架数据：${err.message || String(err)}`);
     }
@@ -65,7 +92,10 @@ export function App() {
 
   useEffect(() => {
     if (activeChild) {
-      void apiClient.listStories(activeChild.id).then(setStories).catch(() => {});
+      void apiClient
+        .listStories(activeChild.id)
+        .then((list) => setStories(sortStoriesNewestFirst(list)))
+        .catch(() => {});
     }
   }, [activeChild?.id]);
 
@@ -163,52 +193,47 @@ export function App() {
           <div class="queue-indicator" title="IndexedDB 离线事件队列">
             {pendingQueueCount > 0 ? `⏳ 待同步事件: ${pendingQueueCount}` : '✅ 数据已同步'}
           </div>
-          <button type="button" class="btn-secondary" onClick={() => setShowGuardian(true)}>
-            🔒 监护人管理
+          <button
+            type="button"
+            class="btn-secondary"
+            onClick={() => setShowGuardian(true)}
+          >
+            监护人工作台
           </button>
         </div>
       </header>
 
       {errorMsg && (
-        <div
-          class="status-notice"
-          style={{
-            background: '#fef2f2',
-            borderColor: '#ef4444',
-            color: '#991b1b',
-            marginBottom: '16px'
-          }}
-        >
-          ⚠️ {errorMsg}
+        <div class="guardian-alert guardian-alert-error" role="alert" style={{ marginBottom: '16px' }}>
+          <span>⚠️ {errorMsg}</span>
+          <button type="button" class="alert-close-btn" onClick={() => setErrorMsg('')}>✕</button>
         </div>
       )}
 
-      <section class="profile-bar">
+      <section class="profile-bar" aria-label="读者与阅读设置">
         <div class="child-switcher">
-          <span class="section-label">当前读者：</span>
-          {children.map((c) => (
+          {children.map((kid) => (
             <button
-              key={c.id}
+              key={kid.id}
               type="button"
-              class={`child-chip ${activeChild?.id === c.id ? 'active' : ''}`}
-              onClick={() => setActiveChild(c)}
+              class={`child-chip ${activeChild?.id === kid.id ? 'active' : ''}`}
+              onClick={() => setActiveChild(kid)}
             >
-              <span>{c.avatar || '🐻'}</span>
-              <span>{c.name}</span>
+              <span>{kid.avatar || '🐻'}</span>
+              <span>{kid.name}</span>
             </button>
           ))}
 
-          <form onSubmit={handleCreateChild} class="inline-add-child">
+          <form class="inline-add-child" onSubmit={handleCreateChild}>
             <input
               type="text"
-              placeholder="新增儿童昵称..."
+              class="input-compact"
+              placeholder="新增小读者..."
+              aria-label="新增小读者姓名"
               value={newChildName}
               onInput={(e) => setNewChildName((e.target as HTMLInputElement).value)}
-              class="input-compact"
             />
-            <button type="submit" class="btn-small">
-              + 创建档案
-            </button>
+            <button type="submit" class="btn-small">添加</button>
           </form>
         </div>
 
@@ -227,82 +252,135 @@ export function App() {
           >
             👨‍👧 家长陪读
           </button>
-
-          <label class="pinyin-toggle">
-            <input
-              type="checkbox"
-              checked={showPinyinHint}
-              onChange={(e) => setShowPinyinHint((e.target as HTMLInputElement).checked)}
-            />
-            显示全句拼音提示
-          </label>
+          <button
+            type="button"
+            class={`mode-btn ${showPinyinHint ? 'active' : ''}`}
+            onClick={() => setShowPinyinHint((v) => !v)}
+          >
+            拼音提示：{showPinyinHint ? '开' : '关'}
+          </button>
         </div>
       </section>
 
-      <main class="bookshelf">
-        <h2>故事书架</h2>
-        {stories.length === 0 ? (
-          <div class="empty-shelf">
-            <p>书架上还没有故事，请点击右上角“🔒 监护人管理”一键生成或导入故事包。</p>
-          </div>
-        ) : (
-          <div class="story-grid">
-            {stories.map((st) => (
-              <article
-                key={st.id}
-                class="story-card"
-                style={{ height: 'auto', containerType: 'normal' }}
-              >
-                <div class="story-card-badge">{st.theme || '童话故事'}</div>
-                <h3>{st.title}</h3>
-                <p class="story-desc">{st.description}</p>
-                <div class="story-meta">
-                  <span>共 {st.sentence_count} 句</span>
-                  {st.recommended_reason && (
-                    <span class="recommend-tag">✨ {st.recommended_reason}</span>
-                  )}
-                </div>
+      <main class="story-grid" aria-label="故事书架（新书排最上面）">
+        {sortedStories.map((st, idx) => {
+          const isOpening = openingStoryId === st.id;
+          const hasResume = (st.resume_sentence_index || 0) > 0 && st.resume_sentence_index < st.sentence_count;
+          const storyAnim = buildStoryRewardAnimation(st as any);
+          const isAnimUnlocked = Boolean(storyAnim && unlockedStoryIds.has(st.id));
 
-                <div class="story-actions">
-                  {st.active_session_id ? (
-                    <>
-                      <button
-                        type="button"
-                        class="btn-primary"
-                        disabled={openingStoryId === st.id}
-                        onClick={() => handleOpenStory(st, false)}
-                      >
-                        {openingStoryId === st.id
-                          ? '正在打开...'
-                          : `继续读（第 ${st.resume_sentence_index + 1} 句）`}
-                      </button>
-                      <button
-                        type="button"
-                        class="btn-secondary"
-                        disabled={openingStoryId === st.id}
-                        onClick={() => handleOpenStory(st, true)}
-                      >
-                        从头读
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      class="btn-primary"
-                      disabled={openingStoryId === st.id}
-                      onClick={() => handleOpenStory(st, false)}
-                    >
-                      {openingStoryId === st.id ? '正在打开...' : '开始阅读'}
-                    </button>
-                  )}
-                </div>
-              </article>
-            ))}
+          return (
+            <article key={st.id} class="story-card">
+              <div class="story-badge-row">
+                <span class="story-card-badge">{st.theme || '趣味故事'}</span>
+                {idx === 0 && <span class="story-new-badge">新书</span>}
+              </div>
+              <h2 style={{ margin: 0, fontSize: '1.2rem' }}>{st.title}</h2>
+              {st.description && (
+                <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.94rem', lineHeight: 1.5 }}>
+                  {st.description}
+                </p>
+              )}
+              <div class="story-meta">
+                <span>共 {st.sentence_count} 页 · v{st.version_number}</span>
+                {st.review_char_count > 0 && (
+                  <span class="recommend-tag">含 {st.review_char_count} 个复习字</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '8px', marginTop: 'auto', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  class="btn-primary"
+                  disabled={isOpening}
+                  onClick={() => void handleOpenStory(st, false)}
+                >
+                  {isOpening ? '打开中...' : hasResume ? `继续读（第 ${st.resume_sentence_index + 1} 页）` : '开始阅读'}
+                </button>
+                {hasResume && (
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    disabled={isOpening}
+                    onClick={() => void handleOpenStory(st, true)}
+                  >
+                    从头读
+                  </button>
+                )}
+                {isAnimUnlocked && storyAnim && (
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    onClick={() => setPlayingStoryAnim(storyAnim)}
+                  >
+                    🎬 看动画
+                  </button>
+                )}
+              </div>
+            </article>
+          );
+        })}
+      </main>
+
+      {/* 原生 <dialog>：单篇故事 1 对 1 专属动画播放器 */}
+      <dialog
+        ref={animDialogRef}
+        class="reward-player-dialog"
+        onClick={(e) => {
+          if (e.target === animDialogRef.current) {
+            setPlayingStoryAnim(null);
+          }
+        }}
+        onCancel={() => setPlayingStoryAnim(null)}
+      >
+        {playingStoryAnim && (
+          <div class="reward-player-sheet">
+            <div class="settings-sheet-header">
+              <strong>🎬 {playingStoryAnim.title}</strong>
+              <button
+                type="button"
+                class="reader-icon-btn"
+                onClick={() => setPlayingStoryAnim(null)}
+                aria-label="关闭动画播放"
+              >
+                ✕
+              </button>
+            </div>
+
+            {playingStoryAnim.media_type === 'image' ? (
+              <img
+                src={playingStoryAnim.url}
+                alt={playingStoryAnim.title}
+                class="reward-player-media"
+                onError={() => setPlayingStoryAnim(null)}
+              />
+            ) : (
+              <video
+                src={playingStoryAnim.url}
+                poster={playingStoryAnim.poster}
+                class="reward-player-media"
+                controls
+                autoPlay
+                playsInline
+                onError={() => setPlayingStoryAnim(null)}
+              />
+            )}
+
+            <button
+              type="button"
+              class="btn-page-next"
+              style={{ width: '100%' }}
+              onClick={() => setPlayingStoryAnim(null)}
+            >
+              看完啦，返回书架
+            </button>
           </div>
         )}
-      </main>
+      </dialog>
     </div>
   );
 }
 
-render(<App />, document.getElementById('app')!);
+const rootEl = document.getElementById('app') || document.body.firstElementChild;
+if (rootEl) {
+  render(<App />, rootEl);
+}

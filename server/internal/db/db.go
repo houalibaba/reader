@@ -31,8 +31,8 @@ func Open(dbPath string) (*sql.DB, error) {
 		"PRAGMA foreign_keys = ON;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA temp_store = FILE;",
-		"PRAGMA mmap_size = 0;",       // Disable mmap to avoid virtual memory spikes on 120MiB router limit
-		"PRAGMA cache_size = -8000;",  // ~8MB page cache cap (from v0.1.0 spec)
+		"PRAGMA mmap_size = 0;",     // Disable mmap to avoid virtual memory spikes on 120MiB router limit
+		"PRAGMA cache_size = -8000;", // ~8MB page cache cap (from v0.1.0 spec)
 	}
 	for _, p := range pragmas {
 		if _, err := conn.Exec(p); err != nil {
@@ -76,5 +76,36 @@ func Migrate(conn *sql.DB) error {
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
 	}
+
+	// 幂等补齐 stories.animation_url 列（支持每篇故事 1 对 1 专属奖励动画）
+	if err := ensureColumn(conn, "stories", "animation_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("ensure stories.animation_url: %w", err)
+	}
 	return nil
+}
+
+func ensureColumn(conn *sql.DB, tableName, colName, colDef string) error {
+	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s);", tableName))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+			if strings.EqualFold(name, colName) {
+				return nil
+			}
+		}
+	}
+	_, err = conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", tableName, colName, colDef))
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return nil
+	}
+	return err
 }

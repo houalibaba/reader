@@ -8,6 +8,12 @@ import {
   QueuedCharacterEvent,
   QueuedVisibilityEvent
 } from '../queue/offlineQueue';
+import {
+  evaluateAndUnlockStoryAnimation,
+  ReadingUnlockOutcome,
+  resolveStoryAnimationUrl,
+  StoryRewardAnimation
+} from '../utils/rewardAnimation';
 
 interface ReaderPageProps {
   session: ReadingSession;
@@ -23,6 +29,17 @@ function makeUUID(prefix: string): string {
 // 拼音与词语提示持续显示 10.5 秒
 const PINYIN_DISPLAY_DURATION_MS = 10500;
 
+function runViewTransition(updateFn: () => void) {
+  const prefersReduced =
+    typeof window !== 'undefined' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!prefersReduced && typeof (document as any).startViewTransition === 'function') {
+    (document as any).startViewTransition(updateFn);
+  } else {
+    updateFn();
+  }
+}
+
 export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPageProps) {
   const [sentenceIndex, setSentenceIndex] = useState<number>(session.current_sentence_index || 0);
   const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
@@ -33,6 +50,10 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const [localPinyinHint, setLocalPinyinHint] = useState<boolean>(showPinyinHint);
   const [showSettingsSheet, setShowSettingsSheet] = useState<boolean>(false);
 
+  // 本篇故事 1 对 1 专属动画解锁状态（无专属动画时静默跳过）
+  const [unlockOutcome, setUnlockOutcome] = useState<ReadingUnlockOutcome | null>(null);
+  const [playingRewardAnim, setPlayingRewardAnim] = useState<StoryRewardAnimation | null>(null);
+
   // 当前读者的复习字与新字集合（用于阅读页底色标记）
   const [reviewCharSet, setReviewCharSet] = useState<Set<string>>(() => new Set());
   const [newCharSet, setNewCharSet] = useState<Set<string>>(() => new Set());
@@ -41,11 +62,16 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const enteredAtIsoRef = useRef<string>(new Date().toISOString());
   const enteredAtPerfRef = useRef<number>(performance.now());
   const hiddenStartedAtRef = useRef<number | null>(null);
+  const pageBgHiddenMsRef = useRef<number>(0);
   const lifecycleExitFlushedRef = useRef<boolean>(false);
   const visitedIndicesRef = useRef<Set<number>>(new Set([session.current_sentence_index || 0]));
   const highlightTimerRef = useRef<number | null>(null);
-  const imageDialogRef = useRef<HTMLDialogElement | null>(null);
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
+  const rewardDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  // 防刷读追踪：累计每页的真实前台活跃停留时长与整篇互动次数
+  const pageActiveMsRef = useRef<Record<number, number>>({});
+  const interactionCountRef = useRef<number>(0);
 
   const charEventsRef = useRef<QueuedCharacterEvent[]>([]);
   const audioEventsRef = useRef<QueuedAudioEvent[]>([]);
@@ -87,6 +113,16 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     };
   }, [session.child_id]);
 
+  const recordCurrentPageActiveDuration = () => {
+    const nowPerf = performance.now();
+    const ongoingHiddenMs =
+      hiddenStartedAtRef.current !== null ? Math.max(0, nowPerf - hiddenStartedAtRef.current) : 0;
+    const rawElapsed = Math.max(0, nowPerf - enteredAtPerfRef.current);
+    const activeMs = Math.max(0, Math.round(rawElapsed - pageBgHiddenMsRef.current - ongoingHiddenMs));
+    pageActiveMsRef.current[sentenceIndex] =
+      (pageActiveMsRef.current[sentenceIndex] || 0) + activeMs;
+  };
+
   const flushCurrentSentenceView = async (
     nextIndex: number,
     status: 'active' | 'completed' | 'abandoned' = 'active',
@@ -126,18 +162,6 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   };
 
   useEffect(() => {
-    const dialog = imageDialogRef.current;
-    if (!dialog) return;
-    if (isImageFullscreen) {
-      if (!dialog.open && typeof dialog.showModal === 'function') {
-        dialog.showModal();
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [isImageFullscreen]);
-
-  useEffect(() => {
     const dialog = settingsDialogRef.current;
     if (!dialog) return;
     if (showSettingsSheet) {
@@ -150,10 +174,23 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   }, [showSettingsSheet]);
 
   useEffect(() => {
+    const dialog = rewardDialogRef.current;
+    if (!dialog) return;
+    if (playingRewardAnim) {
+      if (!dialog.open && typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [playingRewardAnim]);
+
+  useEffect(() => {
     lifecycleExitFlushedRef.current = false;
     viewIdRef.current = makeUUID('sv');
     enteredAtIsoRef.current = new Date().toISOString();
     enteredAtPerfRef.current = performance.now();
+    pageBgHiddenMsRef.current = 0;
     charEventsRef.current = [];
     audioEventsRef.current = [];
     visibilityEventsRef.current = [];
@@ -202,6 +239,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
         flushOnLifecycleExit();
       } else if (document.visibilityState === 'visible' && hiddenStartedAtRef.current !== null) {
         const bgMs = Math.max(0, Math.round(performance.now() - hiddenStartedAtRef.current));
+        pageBgHiddenMsRef.current += bgMs;
         hiddenStartedAtRef.current = null;
         lifecycleExitFlushedRef.current = false;
         visibilityEventsRef.current.push({
@@ -228,7 +266,26 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     };
   }, [sentenceIndex]);
 
+  // 全屏看图支持 Esc 键退出
+  useEffect(() => {
+    if (!isImageFullscreen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        runViewTransition(() => setIsImageFullscreen(false));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isImageFullscreen]);
+
+  const handleToggleFullscreen = (nextState?: boolean) => {
+    runViewTransition(() => {
+      setIsImageFullscreen((prev) => (typeof nextState === 'boolean' ? nextState : !prev));
+    });
+  };
+
   const handleTokenClick = async (token: SentenceToken) => {
+    interactionCountRef.current += 1;
     setActiveToken(token);
     setActiveWordIndex(token.word_index);
 
@@ -256,6 +313,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
 
   const handlePlayWholeSentence = async () => {
     if (!currentSentence) return;
+    interactionCountRef.current += 1;
     setPlayingAudio(true);
     const playedIso = new Date().toISOString();
     const res = await audioPlayer.playUrlOrFallback(currentSentence.audio_url, currentSentence.text);
@@ -273,6 +331,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
 
   const handlePrevSentence = async () => {
     if (sentenceIndex <= 0) return;
+    recordCurrentPageActiveDuration();
     const prevIdx = sentenceIndex - 1;
     await flushCurrentSentenceView(prevIdx, 'active');
     visitedIndicesRef.current.add(prevIdx);
@@ -280,6 +339,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   };
 
   const handleNextSentence = async () => {
+    recordCurrentPageActiveDuration();
     if (sentenceIndex < story.sentences.length - 1) {
       const nextIdx = sentenceIndex + 1;
       await flushCurrentSentenceView(nextIdx, 'active');
@@ -288,11 +348,30 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     } else {
       lifecycleExitFlushedRef.current = true;
       await flushCurrentSentenceView(sentenceIndex, 'completed', 'finished', true);
+
+      // 1 对 1 防刷校验：仅当本篇故事配置了专属动画时才触发解锁
+      const pageCharCounts: Record<number, number> = {};
+      story.sentences.forEach((s, idx) => {
+        pageCharCounts[idx] = Array.from(s.text || '').length;
+      });
+      const outcome = evaluateAndUnlockStoryAnimation({
+        childId: session.child_id,
+        storyId: story.story_id,
+        storyTitle: story.title,
+        animationUrl: resolveStoryAnimationUrl(story),
+        posterUrl: story.cover_url,
+        totalSentences: story.sentences.length,
+        pageActiveMs: pageActiveMsRef.current,
+        pageCharCounts,
+        interactionCount: interactionCountRef.current
+      });
+      setUnlockOutcome(outcome);
       setIsFinishedCelebration(true);
     }
   };
 
   const handleSaveAndExit = async () => {
+    recordCurrentPageActiveDuration();
     lifecycleExitFlushedRef.current = true;
     await flushCurrentSentenceView(sentenceIndex, 'active', 'user_exit');
     onExit();
@@ -305,8 +384,10 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const bgImageUrl = currentSentence.image_url || story.cover_url || '';
 
   return (
-    <div class="reader-stage-immersive">
-      {/* 最底层：当前插图全屏高斯模糊氛围背景 */}
+    <div
+      class="reader-stage-immersive"
+      data-image-only={isImageFullscreen ? 'true' : 'false'}
+    >
       <div
         class="reader-ambient-bg"
         style={bgImageUrl ? { backgroundImage: `url("${bgImageUrl}")` } : undefined}
@@ -314,29 +395,65 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
       />
       <div class="reader-ambient-scrim" aria-hidden="true" />
 
+      <div
+        key={currentSentence.id}
+        class="reader-hero-canvas"
+        onClick={() => {
+          if (bgImageUrl) {
+            handleToggleFullscreen();
+          }
+        }}
+        role={bgImageUrl ? 'button' : undefined}
+        tabIndex={bgImageUrl ? 0 : undefined}
+        aria-label={isImageFullscreen ? '点击退出全屏看图' : '点击插画进入全屏看图'}
+        onKeyDown={(e) => {
+          if ((e.key === 'Enter' || e.key === ' ') && bgImageUrl) {
+            e.preventDefault();
+            handleToggleFullscreen();
+          }
+        }}
+      >
+        {bgImageUrl ? (
+          <img
+            src={bgImageUrl}
+            alt={story.title}
+            class="reader-hero-img"
+            fetchpriority="high"
+          />
+        ) : (
+          <div class="story-image-placeholder">
+            <span>插图（第 {sentenceIndex + 1} 页 · {story.title}）</span>
+          </div>
+        )}
+      </div>
+
       <div class="reader-stage">
-        {/* 极简顶部导航：左返回箭头 + 中间进度条 + 页码 + 右侧设置齿轮 */}
-        <header class="reader-topbar-minimal">
+        <header class="reader-topbar-glass">
           <button
             type="button"
-            class="reader-icon-btn"
+            class="reader-pill-btn"
             onClick={handleSaveAndExit}
             aria-label="保存并返回书架"
-            title="保存并返回书架"
           >
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M19 12H5" />
-              <path d="M12 19l-7-7 7-7" />
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 14L4 9l5-5" />
+              <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11" />
             </svg>
+            <span>退出</span>
           </button>
 
-          <div class="reader-progress-track" role="progressbar" aria-valuenow={sentenceIndex + 1} aria-valuemin={1} aria-valuemax={totalSentences}>
-            <div class="reader-progress-fill" style={{ width: `${progressPct}%` }} />
+          <div class="reader-topbar-center">
+            <h1 class="reader-story-title">{story.title}</h1>
+            <div
+              class="reader-progress-track"
+              role="progressbar"
+              aria-valuenow={sentenceIndex + 1}
+              aria-valuemin={1}
+              aria-valuemax={totalSentences}
+            >
+              <div class="reader-progress-fill" style={{ width: `${progressPct}%` }} />
+            </div>
           </div>
-
-          <span class="reader-page-counter">
-            {sentenceIndex + 1} / {totalSentences}
-          </span>
 
           <button
             type="button"
@@ -345,100 +462,115 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
             aria-label="阅读设置"
             title="阅读设置"
           >
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
           </button>
         </header>
 
-        {/* 紧凑型插图区：约占屏幕 1/4 高度，保证下方整句话一屏内完整显示 */}
-        <div key={currentSentence.id} class="reader-illustration-compact">
-          {currentSentence.image_url ? (
-            <img
-              src={currentSentence.image_url}
-              alt={story.title}
-              class="story-image"
-              fetchpriority="high"
-              style={{ cursor: 'zoom-in' }}
-              title="点击放大查看插图"
-              onClick={() => setIsImageFullscreen(true)}
-            />
-          ) : (
-            <div class="story-image-placeholder">
-              <span>插图（第 {sentenceIndex + 1} 页 · {story.title}）</span>
-            </div>
-          )}
-        </div>
-
-        {/* 毛玻璃文字卡片：按词语换行 + 复习字/新字高亮 + 点一下出拼音 */}
-        <SentenceDisplay
-          tokens={currentSentence.tokens}
-          activeWordIndex={activeWordIndex}
-          activeTokenId={activeToken?.id || null}
-          showPinyinHint={localPinyinHint}
-          reviewChars={reviewCharSet}
-          newChars={newCharSet}
-          showLegend={true}
-          onTokenClick={handleTokenClick}
+        <div
+          class="reader-visual-spacer"
+          onClick={() => {
+            if (bgImageUrl) handleToggleFullscreen(true);
+          }}
         />
 
-        {/* 底部操控栏：左白框上一页 + 中间圆形喇叭 + 右黑底下一页 */}
-        <footer class="reader-controls-modern">
-          <button
-            type="button"
-            class="btn-page-prev"
-            disabled={sentenceIndex === 0}
-            onClick={handlePrevSentence}
-          >
-            ‹ 上一页
-          </button>
+        <section class="reader-floating-dock" aria-label="点读与翻页控制区">
+          <SentenceDisplay
+            tokens={currentSentence.tokens}
+            activeWordIndex={activeWordIndex}
+            activeTokenId={activeToken?.id || null}
+            showPinyinHint={localPinyinHint}
+            reviewChars={reviewCharSet}
+            newChars={newCharSet}
+            showLegend={true}
+            onTokenClick={handleTokenClick}
+          />
 
-          <button
-            type="button"
-            class={`btn-audio-circle ${playingAudio ? 'is-playing' : ''}`}
-            onClick={handlePlayWholeSentence}
-            disabled={playingAudio}
-            aria-label={playingAudio ? '正在朗读整句' : '听整句朗读'}
-            title="听整句朗读"
-          >
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-            </svg>
-          </button>
+          <footer class="reader-dock-controls">
+            <span class="reader-page-pill" aria-label={`第 ${sentenceIndex + 1} 页，共 ${totalSentences} 页`}>
+              {sentenceIndex + 1} / {totalSentences}
+            </span>
 
-          <button
-            type="button"
-            class="btn-page-next"
-            onClick={handleNextSentence}
-          >
-            {sentenceIndex < story.sentences.length - 1 ? '下一页 ›' : '读完啦 ›'}
-          </button>
-        </footer>
+            <div class="reader-nav-cluster" role="group" aria-label="翻页与整句朗读">
+              <button
+                type="button"
+                class="cluster-btn"
+                disabled={sentenceIndex === 0}
+                onClick={handlePrevSentence}
+                aria-label="上一页"
+                title="上一页"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M15.5 19l-7-7 7-7v14z" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                class={`cluster-btn cluster-btn-audio ${playingAudio ? 'is-playing' : ''}`}
+                onClick={handlePlayWholeSentence}
+                disabled={playingAudio}
+                aria-label={playingAudio ? '正在朗读整句' : '听整句朗读'}
+                title="听整句朗读"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                class="cluster-btn"
+                onClick={handleNextSentence}
+                aria-label={sentenceIndex < story.sentences.length - 1 ? '下一页' : '完成阅读'}
+                title={sentenceIndex < story.sentences.length - 1 ? '下一页' : '完成阅读'}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M8.5 5l7 7-7 7V5z" />
+                </svg>
+              </button>
+            </div>
+
+            <button
+              type="button"
+              class="reader-fullscreen-btn"
+              disabled={!bgImageUrl}
+              onClick={() => handleToggleFullscreen(true)}
+              aria-label="全屏看图"
+              title="全屏看图"
+            >
+              <span class="fullscreen-btn-label">全屏看图</span>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+                <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
+                <path d="M3 16v3a2 2 0 0 0 2 2h3" />
+                <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+              </svg>
+            </button>
+          </footer>
+        </section>
       </div>
 
-      {/* 原生 HTML <dialog> 全屏插图查看器 */}
-      <dialog
-        ref={imageDialogRef}
-        class="fullscreen-image-dialog"
-        onClick={() => setIsImageFullscreen(false)}
-        onCancel={() => setIsImageFullscreen(false)}
-      >
-        {currentSentence.image_url && (
-          <div class="dialog-image-wrapper">
-            <img
-              src={currentSentence.image_url}
-              alt={story.title}
-              class="dialog-fullscreen-img"
-            />
-            <span class="dialog-close-hint">点击任意位置返回阅读</span>
-          </div>
-        )}
-      </dialog>
+      {isImageFullscreen && (
+        <button
+          type="button"
+          class="reader-exit-fullscreen-pill"
+          onClick={() => handleToggleFullscreen(false)}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 14h6v6" />
+            <path d="M20 10h-6V4" />
+            <path d="M14 10l7-7" />
+            <path d="M3 21l7-7" />
+          </svg>
+          <span>显示文字</span>
+        </button>
+      )}
 
-      {/* 原生 HTML <dialog> 阅读设置弹窗 */}
       <dialog
         ref={settingsDialogRef}
         class="reader-settings-dialog"
@@ -488,7 +620,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
         </div>
       </dialog>
 
-      {/* 读完本篇庆祝激励弹窗 */}
+      {/* 读完本篇庆祝激励弹窗（1 对 1 专属动画；无专属动画时静默隐藏） */}
       {isFinishedCelebration && (
         <div
           role="dialog"
@@ -502,12 +634,35 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
             <p>
               共坚持读完 <strong>{story.sentences.length}</strong> 页故事，今天又是爱阅读的一天！
             </p>
+
+            {unlockOutcome && unlockOutcome.reason !== 'no_animation' && (
+              <div
+                class={`reward-unlock-banner ${
+                  unlockOutcome.qualified ? 'is-unlocked' : 'is-reminder'
+                }`}
+              >
+                <p class="reward-unlock-msg">{unlockOutcome.message}</p>
+                {unlockOutcome.qualified && unlockOutcome.animation && (
+                  <button
+                    type="button"
+                    class="btn-reward-play"
+                    onClick={() => setPlayingRewardAnim(unlockOutcome.animation)}
+                  >
+                    🎬 {unlockOutcome.newlyUnlocked ? '播放本篇专属动画' : '重温本篇专属动画'}
+                  </button>
+                )}
+              </div>
+            )}
+
             <div class="celebration-actions">
               <button
                 type="button"
                 class="btn-page-prev"
                 onClick={() => {
                   setIsFinishedCelebration(false);
+                  setUnlockOutcome(null);
+                  pageActiveMsRef.current = {};
+                  interactionCountRef.current = 0;
                   setSentenceIndex(0);
                 }}
               >
@@ -527,6 +682,62 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
           </div>
         </div>
       )}
+
+      {/* 原生 HTML <dialog> 本篇专属动画播放器 */}
+      <dialog
+        ref={rewardDialogRef}
+        class="reward-player-dialog"
+        onClick={(e) => {
+          if (e.target === rewardDialogRef.current) {
+            setPlayingRewardAnim(null);
+          }
+        }}
+        onCancel={() => setPlayingRewardAnim(null)}
+      >
+        {playingRewardAnim && (
+          <div class="reward-player-sheet">
+            <div class="settings-sheet-header">
+              <strong>🎬 {playingRewardAnim.title}</strong>
+              <button
+                type="button"
+                class="reader-icon-btn"
+                onClick={() => setPlayingRewardAnim(null)}
+                aria-label="关闭动画播放"
+              >
+                ✕
+              </button>
+            </div>
+
+            {playingRewardAnim.media_type === 'image' ? (
+              <img
+                src={playingRewardAnim.url}
+                alt={playingRewardAnim.title}
+                class="reward-player-media"
+                onError={() => setPlayingRewardAnim(null)}
+              />
+            ) : (
+              <video
+                src={playingRewardAnim.url}
+                poster={playingRewardAnim.poster}
+                class="reward-player-media"
+                controls
+                autoPlay
+                playsInline
+                onError={() => setPlayingRewardAnim(null)}
+              />
+            )}
+
+            <button
+              type="button"
+              class="btn-page-next"
+              style={{ width: '100%' }}
+              onClick={() => setPlayingRewardAnim(null)}
+            >
+              看完啦，返回
+            </button>
+          </div>
+        )}
+      </dialog>
     </div>
   );
 }

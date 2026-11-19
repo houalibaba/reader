@@ -1,18 +1,17 @@
 /* ==========================================================================
-   admin-theme.css — 监护人工作台移动端优先规范 (Modern Web Guidance)
-   1. 所有内容严格不超过屏幕宽度 (overflow-x: hidden, min-width: 0, max-width: 100%)
-   2. 2×2 四宫格统计卡片（已掌握字、急需复习、待巩固、本篇新字）
-   3. 复习字按保留率从低到高排序 + 彩色圆角进度条
-   4. 复制提示词、导入正文、预览发布三步流程 + 提示词全文默认折叠
+   admin-theme.css — 监护人工作台重做版 (Modern Web Guidance)
+   1. 100dvh 三段式固定网格：顶栏固定 + 中间独立滚动 + 吸底四栏导航固定不动
+   2. 顶部 4 指标卡片（本周阅读 / 阅读时长 / 累计识字 / 待复习字）Container Query 自适应
+   3. View Transitions 平滑切换中间图表、复习字列表、已掌握字网格与原四宫格概览
+   4. 原生 <dialog> 顶层菜单弹窗 + @starting-style 进出场过渡
    ========================================================================== */
 
 body[data-mode="admin"] {
-  height: auto;
-  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;
   width: 100%;
   max-width: 100vw;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   user-select: text;
   -webkit-user-select: text;
   -webkit-touch-callout: default;
@@ -22,38 +21,42 @@ body[data-mode="admin"] {
 .guardian-mobile-shell {
   width: 100%;
   max-width: 100vw;
-  min-height: 100dvh;
-  padding: clamp(8px, 2.5vw, 24px);
+  height: 100vh;
+  height: 100dvh;
+  padding: clamp(0px, 1.5vw, 16px);
   display: flex;
   justify-content: center;
-  align-items: flex-start;
-  overflow-x: hidden;
+  align-items: stretch;
+  overflow: hidden;
 }
 
 .guardian-card-container {
   width: 100%;
   max-width: 520px;
   min-width: 0;
+  height: 100%;
   background: #ffffff;
   border: 1px solid rgba(20, 24, 31, 0.08);
-  border-radius: 26px;
+  border-radius: clamp(0px, 3vw, 26px);
   box-shadow: 0 12px 34px -10px rgba(20, 24, 31, 0.08);
-  padding: clamp(18px, 4.5vw, 26px);
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  overflow-x: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
 }
 
 /* ==========================================================================
-   顶部标题栏：监护人工作台 + 读者版本 + 右侧菜单按钮
+   顶部固定标题栏：监护人工作台 + 读者版本 + 返回阅读 & 菜单按钮
    ========================================================================== */
 .guardian-top-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-width: 0;
+  padding: 16px clamp(16px, 4.5vw, 24px) 12px;
+  background: #ffffff;
+  border-bottom: 1px solid rgba(20, 24, 31, 0.06);
+  z-index: 2;
 }
 
 .guardian-title-block {
@@ -62,37 +65,73 @@ body[data-mode="admin"] {
 
 .guardian-title-block h1 {
   margin: 0;
-  font-size: clamp(1.32rem, 4.5vw, 1.55rem);
+  font-size: clamp(1.28rem, 4.5vw, 1.5rem);
   font-weight: 700;
   color: #14181f;
   line-height: 1.25;
 }
 
 .guardian-reader-meta {
-  margin: 4px 0 0;
-  font-size: 0.92rem;
+  margin: 3px 0 0;
+  font-size: 0.88rem;
   color: #68707c;
+}
+
+.guardian-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.guardian-back-reader-btn {
+  height: 34px;
+  padding: 0 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(20, 24, 31, 0.12);
+  background: #faf9f6;
+  color: #14181f;
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.guardian-back-reader-btn:active {
+  background: #eceae4;
 }
 
 .guardian-menu-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 40px;
+  width: 38px;
+  height: 38px;
   border: none;
   border-radius: 12px;
   background: transparent;
   color: #14181f;
   cursor: pointer;
-  flex-shrink: 0;
 }
 
 .guardian-menu-btn:active {
   background: #f2f4f7;
 }
 
-/* 状态与错误提示条 */
+/* ==========================================================================
+   中间独立滚动容器
+   ========================================================================== */
+.guardian-scroll-viewport {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px clamp(16px, 4.5vw, 24px) 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
 .guardian-alert {
   display: flex;
   align-items: center;
@@ -131,18 +170,115 @@ body[data-mode="admin"] {
 .guardian-main-body {
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 18px;
   min-width: 0;
   width: 100%;
 }
 
 /* ==========================================================================
-   2×2 四宫格统计卡片（严格对齐设计图配色与排版）
+   顶部四卡片 Tab 切换器（本周阅读 / 阅读时长 / 累计识字 / 待复习字）
+   ========================================================================== */
+.guardian-top-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.kpi-tab-card {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 10px 4px;
+  border-radius: 14px;
+  border: 1.5px solid transparent;
+  background: var(--kpi-bg, #f3f4f6);
+  color: #14181f;
+  cursor: pointer;
+  transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease;
+}
+
+.kpi-tab-card[data-tone="green"] { --kpi-bg: #e7f6e9; --kpi-ring: #22c55e; }
+.kpi-tab-card[data-tone="blue"]  { --kpi-bg: #eef5ff; --kpi-ring: #3b82f6; }
+.kpi-tab-card[data-tone="amber"] { --kpi-bg: #fef5e3; --kpi-ring: #d97706; }
+.kpi-tab-card[data-tone="sky"]   { --kpi-bg: #ebf6ff; --kpi-ring: #0284c7; }
+
+.kpi-tab-card[aria-selected="true"] {
+  border-color: var(--kpi-ring);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--kpi-ring) 18%, transparent);
+  transform: translateY(-1px);
+}
+
+.kpi-tab-icon {
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.kpi-tab-label {
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: #4b5563;
+  white-space: nowrap;
+}
+
+.kpi-tab-value {
+  font-size: 1.12rem;
+  font-weight: 700;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+
+.kpi-tab-unit {
+  font-size: 0.7rem;
+  font-weight: 500;
+  margin-left: 1px;
+}
+
+@container (max-width: 82px) {
+  .kpi-tab-icon  { font-size: 1.15rem; }
+  .kpi-tab-label { font-size: 0.68rem; }
+  .kpi-tab-value { font-size: 0.96rem; }
+}
+
+/* 中间动态面板容器 */
+.guardian-dynamic-panel {
+  background: #faf9f6;
+  border: 1px solid rgba(20, 24, 31, 0.07);
+  border-radius: 18px;
+  padding: 14px;
+}
+
+@supports (view-transition-name: none) {
+  .guardian-dynamic-panel {
+    view-transition-name: guardian-dynamic-panel;
+  }
+}
+
+.duration-svg-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.compact-range-select {
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(20, 24, 31, 0.14);
+  background: #ffffff;
+  font-size: 0.8rem;
+  color: #4b5563;
+}
+
+/* ==========================================================================
+   原 2×2 四宫格统计卡片（点击已激活的「阅读时长」可切换查看）
    ========================================================================== */
 .guardian-stats-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 10px;
   width: 100%;
 }
 
@@ -151,24 +287,23 @@ body[data-mode="admin"] {
   flex-direction: column;
   justify-content: center;
   gap: 6px;
-  padding: 16px 18px;
-  border-radius: 16px;
+  padding: 14px 16px;
+  border-radius: 14px;
   min-width: 0;
 }
 
 .stat-tile-label {
-  font-size: 0.9rem;
+  font-size: 0.86rem;
   font-weight: 500;
 }
 
 .stat-tile-value {
-  font-size: clamp(1.65rem, 5.5vw, 2rem);
+  font-size: clamp(1.5rem, 5vw, 1.85rem);
   font-weight: 700;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 
-/* 已掌握字：浅灰底黑字 */
 .stat-tile-mastered {
   background-color: #f3f3f1;
   color: #14181f;
@@ -177,22 +312,55 @@ body[data-mode="admin"] {
   color: #5a6270;
 }
 
-/* 急需复习：浅粉红底深红字 */
 .stat-tile-urgent {
   background-color: #f9dbdc;
   color: #9e2a35;
 }
 
-/* 待巩固：浅暖黄底深棕橙字 */
 .stat-tile-observe {
   background-color: #f9dfb0;
   color: #8c5308;
 }
 
-/* 本篇新字：浅绿底深绿字 */
 .stat-tile-new {
   background-color: #cdeccd;
   color: #156629;
+}
+
+/* ==========================================================================
+   累计识字 6 列汉字网格（content-visibility: auto 优化长列表）
+   ========================================================================== */
+.mastered-char-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  width: 100%;
+}
+
+.mastered-char-tile {
+  content-visibility: auto;
+  contain-intrinsic-size: 50px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 2px;
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid rgba(20, 24, 31, 0.06);
+}
+
+.mastered-char-py {
+  font-size: 0.68rem;
+  color: #68707c;
+  line-height: 1.1;
+}
+
+.mastered-char-hz {
+  font-size: 1.12rem;
+  font-weight: 600;
+  color: #14181f;
+  line-height: 1.25;
 }
 
 /* ==========================================================================
@@ -202,7 +370,7 @@ body[data-mode="admin"] {
 .guardian-steps-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
   width: 100%;
 }
@@ -216,16 +384,17 @@ body[data-mode="admin"] {
 
 .section-caption {
   margin: 0;
-  font-size: 0.95rem;
-  font-weight: 500;
-  color: #68707c;
+  font-size: 0.94rem;
+  font-weight: 600;
+  color: #4b5563;
 }
 
 .text-link-btn {
   border: none;
   background: transparent;
-  color: #68707c;
-  font-size: 0.85rem;
+  color: #2563eb;
+  font-size: 0.84rem;
+  font-weight: 500;
   cursor: pointer;
   padding: 2px 4px;
 }
@@ -233,7 +402,7 @@ body[data-mode="admin"] {
 .retention-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 11px;
   width: 100%;
 }
 
@@ -255,22 +424,22 @@ body[data-mode="admin"] {
 }
 
 .retention-hanzi {
-  font-size: 1.25rem;
+  font-size: 1.2rem;
   font-weight: 600;
   color: #14181f;
   line-height: 1.1;
 }
 
 .retention-pinyin {
-  font-size: 0.85rem;
+  font-size: 0.82rem;
   color: #7c8594;
   white-space: nowrap;
 }
 
 .retention-track {
   width: 100%;
-  height: 10px;
-  background-color: #f1f0ec;
+  height: 9px;
+  background-color: #eceae4;
   border-radius: 999px;
   overflow: hidden;
 }
@@ -281,21 +450,13 @@ body[data-mode="admin"] {
   transition: width 0.35s ease;
 }
 
-.retention-fill-low {
-  background-color: #c93b3b;
-}
-
-.retention-fill-mid {
-  background-color: #ee9b11;
-}
-
-.retention-fill-high {
-  background-color: #8c8c88;
-}
+.retention-fill-low { background-color: #c93b3b; }
+.retention-fill-mid { background-color: #ee9b11; }
+.retention-fill-high { background-color: #8c8c88; }
 
 .retention-pct {
   text-align: right;
-  font-size: 0.92rem;
+  font-size: 0.88rem;
   color: #5a6270;
   font-variant-numeric: tabular-nums;
 }
@@ -304,8 +465,8 @@ body[data-mode="admin"] {
   align-self: flex-start;
   border: none;
   background: transparent;
-  color: #7c8594;
-  font-size: 0.9rem;
+  color: #68707c;
+  font-size: 0.86rem;
   padding: 4px 0;
   cursor: pointer;
 }
@@ -327,11 +488,11 @@ body[data-mode="admin"] {
   justify-content: center;
   gap: 8px;
   width: 100%;
-  min-height: 52px;
-  padding: 12px 16px;
+  min-height: 48px;
+  padding: 11px 16px;
   border-radius: 14px;
   font-family: var(--font-hanzi);
-  font-size: 1.02rem;
+  font-size: 0.98rem;
   font-weight: 600;
   cursor: pointer;
   transition: transform 0.14s ease, background-color 0.15s ease, border-color 0.15s ease;
@@ -364,7 +525,6 @@ body[data-mode="admin"] {
   border: 1px solid #fecaca;
 }
 
-/* 步骤 2 / 步骤 3 展开内嵌抽屉 */
 .step-drawer-card {
   display: flex;
   flex-direction: column;
@@ -447,7 +607,6 @@ body[data-mode="admin"] {
   border-radius: 12px;
 }
 
-/* 步骤 3 内嵌预览与逐句配图列表 */
 .preview-mini-header {
   display: flex;
   align-items: center;
@@ -525,7 +684,6 @@ body[data-mode="admin"] {
   white-space: nowrap;
 }
 
-/* 查看完整提示词：原生 <details> 默认折叠 */
 .prompt-collapse-details {
   width: 100%;
   min-width: 0;
@@ -566,7 +724,9 @@ body[data-mode="admin"] {
   background: #faf9f5;
 }
 
-/* 书架管理与升级视图 */
+/* ==========================================================================
+   书架管理与升级视图（保持原样）
+   ========================================================================== */
 .story-manage-list {
   display: flex;
   flex-direction: column;
@@ -664,15 +824,17 @@ body[data-mode="admin"] {
 }
 
 /* ==========================================================================
-   底部四栏导航：识字计划 | 书架 | 备份 | 升级
+   底部四栏固定吸底导航：识字计划 | 书架 | 备份 | 升级（滚动时不动）
    ========================================================================== */
 .guardian-bottom-nav {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  background: #ffffff;
   border-top: 1px solid rgba(20, 24, 31, 0.08);
-  padding-top: 14px;
-  margin-top: 4px;
+  box-shadow: 0 -2px 10px rgba(20, 24, 31, 0.04);
+  padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
   text-align: center;
+  z-index: 2;
 }
 
 .bottom-nav-item {
@@ -682,7 +844,7 @@ body[data-mode="admin"] {
   font-size: 0.94rem;
   font-weight: 500;
   color: #68707c;
-  padding: 6px 4px;
+  padding: 8px 4px;
   cursor: pointer;
   transition: color 0.15s ease, font-weight 0.15s ease;
 }
@@ -690,4 +852,72 @@ body[data-mode="admin"] {
 .bottom-nav-item.is-active {
   color: #1d4ed8;
   font-weight: 700;
+}
+
+/* ==========================================================================
+   原生 <dialog> 工作台菜单弹窗（@starting-style + allow-discrete 进出场动画）
+   ========================================================================== */
+.guardian-mobile-shell .reader-settings-dialog {
+  width: min(92vw, 380px);
+  max-width: 92vw;
+  padding: 0;
+  border: 1px solid rgba(20, 24, 31, 0.08);
+  border-radius: 20px;
+  background: #ffffff;
+  box-shadow: 0 24px 48px -12px rgba(20, 24, 31, 0.24);
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease,
+    overlay 180ms ease allow-discrete,
+    display 180ms ease allow-discrete;
+}
+
+.guardian-mobile-shell .reader-settings-dialog[open] {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+@starting-style {
+  .guardian-mobile-shell .reader-settings-dialog[open] {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+  }
+}
+
+.guardian-mobile-shell .reader-settings-dialog::backdrop {
+  background: rgba(15, 23, 42, 0.42);
+  backdrop-filter: blur(4px);
+  opacity: 0;
+  transition:
+    opacity 180ms ease,
+    overlay 180ms ease allow-discrete,
+    display 180ms ease allow-discrete;
+}
+
+.guardian-mobile-shell .reader-settings-dialog[open]::backdrop {
+  opacity: 1;
+}
+
+@starting-style {
+  .guardian-mobile-shell .reader-settings-dialog[open]::backdrop {
+    opacity: 0;
+  }
+}
+
+.guardian-mobile-shell .reader-settings-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+}
+
+.guardian-mobile-shell .settings-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 1.02rem;
+  color: #14181f;
 }

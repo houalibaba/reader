@@ -25,7 +25,7 @@ import (
 )
 
 // CurrentVersion is overridden at build time via -ldflags.
-var CurrentVersion = "v0.3.13"
+var CurrentVersion = "v0.3.14"
 
 var localHealthClient = &http.Client{
 	Timeout:   2 * time.Second,
@@ -465,14 +465,14 @@ func buildWatchdogScript(cfg *config.Config, exePath, expectedVersion string, ol
 	script := fmt.Sprintf(`
 RUNTIME_ROOT=%s
 rollback_runtime() {
-    if [ -L "$RUNTIME_ROOT/current.previous" ]; then
-        mv -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current"
-    elif [ -f "$RUNTIME_ROOT/current.previous-none" ]; then
-        rm -f "$RUNTIME_ROOT/current" "$RUNTIME_ROOT/current.previous-none"
-    fi
+	if [ -L "$RUNTIME_ROOT/current.previous" ]; then
+		mv -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current"
+	elif [ -f "$RUNTIME_ROOT/current.previous-none" ]; then
+		rm -f "$RUNTIME_ROOT/current" "$RUNTIME_ROOT/current.previous-none"
+	fi
 }
 commit_runtime() {
-    rm -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current.previous-none"
+	rm -f "$RUNTIME_ROOT/current.previous" "$RUNTIME_ROOT/current.previous-none"
 }
 sleep 1
 echo "[watchdog] stopping old pid %d and restarting %s (target %s)" >> %s
@@ -480,34 +480,34 @@ kill -TERM %d 2>/dev/null || true
 sleep 1
 kill -KILL %d 2>/dev/null || true
 if [ -x /etc/init.d/reader ]; then
-    /etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
+	/etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
 fi
 sleep 2
 if ! (wget -qO- %s 2>/dev/null | grep -q %s || curl -fsS %s 2>/dev/null | grep -q %s); then
-    echo "[watchdog] procd did not bring up new version yet, launching directly" >> %s
-    TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
+	echo "[watchdog] procd did not bring up new version yet, launching directly" >> %s
+	TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
 fi
 OK=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 1
-    if wget -qO- %s 2>/dev/null | grep -q %s || curl -fsS %s 2>/dev/null | grep -q %s; then
-        OK=1
-        echo "[watchdog] verified new version %s is live" >> %s
-        commit_runtime
-        break
-    fi
+	sleep 1
+	if wget -qO- %s 2>/dev/null | grep -q %s || curl -fsS %s 2>/dev/null | grep -q %s; then
+		OK=1
+		echo "[watchdog] verified new version %s is live" >> %s
+		commit_runtime
+		break
+	fi
 done
 if [ "$OK" = "0" ] && [ -f %s.bak ]; then
-    echo "[watchdog] new version failed health check, rolling back binary and runtime" >> %s
-    killall -9 reader 2>/dev/null || true
-    rollback_runtime
-    cp -f %s.bak %s
-    chmod +x %s
-    if [ -x /etc/init.d/reader ]; then
-        /etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
-    fi
-    sleep 1
-    TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
+	echo "[watchdog] new version failed health check, rolling back binary and runtime" >> %s
+	killall -9 reader 2>/dev/null || true
+	rollback_runtime
+	cp -f %s.bak %s
+	chmod +x %s
+	if [ -x /etc/init.d/reader ]; then
+		/etc/init.d/reader restart >> %s 2>&1 || /etc/init.d/reader start >> %s 2>&1
+	fi
+	sleep 1
+	TMPDIR=%s GOMEMLIMIT=120MiB GOGC=50 %s -config %s >> %s 2>&1 &
 fi
 `,
 		q(runtimeRoot), oldPID, exePath, expectedVersion, q(logFile),

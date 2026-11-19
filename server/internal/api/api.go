@@ -45,6 +45,14 @@ type Server struct {
 	allowLoopbackImageFetch bool
 }
 
+type httpStatusError struct {
+	statusCode int
+	err        error
+}
+
+func (e *httpStatusError) Error() string { return e.err.Error() }
+func (e *httpStatusError) Unwrap() error { return e.err }
+
 func NewServer(cfg *config.Config, dbConn *sql.DB, webFS fs.FS) *Server {
 	srv := &Server{
 		cfg:      cfg,
@@ -78,7 +86,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/v1/admin/gist-pull", s.requireGuardianPIN(s.handleAdminGistPull))
 	mux.HandleFunc("/api/v1/admin/export", s.requireGuardianPIN(s.handleAdminExport))
 	mux.HandleFunc("/api/v1/admin/events/", s.requireGuardianPIN(s.handleAdminEventValidity))
-	mux.HandleFunc("/api/v1/admin/stories/", s.requireGuardianPIN(s.handleAdminDeleteStory))
+	mux.HandleFunc("/api/v1/admin/stories/", s.requireGuardianPIN(s.handleAdminStoriesSubroutes))
 	mux.HandleFunc("/api/v1/admin/update/check", s.requireGuardianPIN(s.handleAdminUpdateCheck))
 	mux.HandleFunc("/api/v1/admin/update/apply", s.requireGuardianPIN(s.handleAdminUpdateApply))
 
@@ -132,6 +140,58 @@ func (s *Server) requireGuardianPIN(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// verifyStorageWritable 运行时严格复查外接盘挂载标记与可用空间（fail-closed），
+// 防止外接盘运行中掉线或空间检查失败时误写入路由器闪存。
+func (s *Server) verifyStorageWritable() (int, error) {
+	if s.cfg == nil {
+		return http.StatusServiceUnavailable, errors.New("server config unavailable")
+	}
+	if err := s.cfg.VerifyDiskMount(); err != nil {
+		return http.StatusServiceUnavailable, fmt.Errorf("external storage unavailable: %w", err)
+	}
+	freeMB, ok, err := s.cfg.CheckFreeDiskMB()
+	if err != nil {
+		return http.StatusServiceUnavailable, fmt.Errorf("disk space check failed: %w", err)
+	}
+	if !ok {
+		return http.StatusInsufficientStorage, fmt.Errorf(
+			"free disk space (%d MB) is below minimum required (%d MB)",
+			freeMB, s.cfg.MinFreeDiskMB,
+		)
+	}
+	return http.StatusOK, nil
+}
+
+// verifyDiskMountedOnly 运行时仅复查外接盘挂载（供删除接口使用，避免磁盘满时无法删除释放空间）。
+func (s *Server) verifyDiskMountedOnly() (int, error) {
+	if s.cfg == nil {
+		return http.StatusServiceUnavailable, errors.New("server config unavailable")
+	}
+	if err := s.cfg.VerifyDiskMount(); err != nil {
+		return http.StatusServiceUnavailable, fmt.Errorf("external storage unavailable: %w", err)
+	}
+	return http.StatusOK, nil
+}
+
+// maxUploadBytes 严格遵守配置中的 UploadMaxMB（仅在未配置或 <=0 时使用默认 200MB）
+func (s *Server) maxUploadBytes() int64 {
+	if s.cfg != nil && s.cfg.UploadMaxMB > 0 {
+		return s.cfg.UploadMaxMB * 1024 * 1024
+	}
+	return 200 * 1024 * 1024
+}
+
+func isMaxBytesErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "request body too large")
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -533,7 +593,75 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 		observeTargets = []planTarget{}
 	}
 
-	// Scientific 10-minute reading unfamiliar character budget (~10 distinct unfamiliar/review chars total)
+	type sessionMetric struct {
+		Date    string `json:"date"`
+		Minutes int    `json:"minutes"`
+		Title   string `json:"title"`
+	}
+	cstLoc := time.FixedZone("CST", 8*3600)
+	sevenDaysAgo := now.AddDate(0, 0, -7)
+	weeklyReadCount := 0
+	weeklyMinutes := 0
+	allMinutes := 0
+	var recentSessionsRev []sessionMetric
+
+	sessRows, sessErr := s.db.QueryContext(ctx, `
+		SELECT COALESCE(s.title, ''), rs.started_at, COALESCE(rs.ended_at, ''), rs.current_sentence_index
+		FROM reading_sessions rs
+		LEFT JOIN story_versions sv ON rs.story_version_id = sv.id
+		LEFT JOIN stories s ON sv.story_id = s.id
+		WHERE rs.child_id = ?
+		ORDER BY rs.started_at DESC
+		LIMIT 30
+	`, childID)
+	if sessErr == nil {
+		for sessRows.Next() {
+			var stTitle, startedStr, endedStr string
+			var curIdx int
+			if err := sessRows.Scan(&stTitle, &startedStr, &endedStr, &curIdx); err != nil {
+				continue
+			}
+			startT, okStart := parseSQLiteTime(startedStr)
+			if !okStart {
+				continue
+			}
+			mins := 0
+			if endT, okEnd := parseSQLiteTime(endedStr); okEnd && endT.After(startT) {
+				diffMins := int(math.Round(endT.Sub(startT).Minutes()))
+				if diffMins >= 1 && diffMins <= 120 {
+					mins = diffMins
+				}
+			}
+			if mins <= 0 {
+				est := int(math.Round(float64(curIdx+1) * 0.6))
+				if est < 1 {
+					est = 1
+				}
+				mins = est
+			}
+			allMinutes += mins
+			if !startT.Before(sevenDaysAgo) {
+				weeklyReadCount++
+				weeklyMinutes += mins
+			}
+			recentSessionsRev = append(recentSessionsRev, sessionMetric{
+				Date:    startT.In(cstLoc).Format("01-02"),
+				Minutes: mins,
+				Title:   stTitle,
+			})
+		}
+		_ = sessRows.Close()
+	}
+
+	readingSessions := make([]sessionMetric, 0, len(recentSessionsRev))
+	for i := len(recentSessionsRev) - 1; i >= 0; i-- {
+		readingSessions = append(readingSessions, recentSessionsRev[i])
+	}
+	totalReadMinutes := weeklyMinutes
+	if totalReadMinutes == 0 {
+		totalReadMinutes = allMinutes
+	}
+
 	totalBudget := 10
 	forgettingCount := len(reviewTargets) + len(observeTargets)
 	newQuota := totalBudget - forgettingCount
@@ -648,6 +776,9 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 			"new_candidates_count":        len(newCandidates),
 			"reading_duration_minutes":    10,
 			"target_total_chars":          "360~450",
+			"weekly_read_count":           weeklyReadCount,
+			"total_read_minutes":          totalReadMinutes,
+			"reading_sessions":            readingSessions,
 		},
 		ReadingScience: map[string]any{
 			"reading_duration_minutes":      10,
@@ -676,6 +807,229 @@ func (s *Server) handleChildStoryPlan(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 	writeJSON(w, http.StatusOK, plan)
+}
+
+func isAllowedAnimationExt(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".mp4", ".webm", ".gif", ".webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRewardAnimationFile(name string) bool {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".tmp") {
+		return false
+	}
+	return strings.HasPrefix(lower, "reward.") || strings.HasPrefix(lower, "reward_")
+}
+
+func newRewardAnimationFilename(ext string) string {
+	return newID("reward") + strings.ToLower(ext)
+}
+
+func removeExistingRewardAnimations(storyDir string) {
+	removeOtherRewardAnimations(storyDir, "")
+}
+
+func removeOtherRewardAnimations(storyDir, keepName string) {
+	entries, err := os.ReadDir(storyDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if isRewardAnimationFile(name) && name != keepName {
+			_ = os.Remove(filepath.Join(storyDir, name))
+		}
+	}
+}
+
+// handleAdminStoriesSubroutes 分发 /api/v1/admin/stories/:id 及 /api/v1/admin/stories/:id/animation
+func (s *Server) handleAdminStoriesSubroutes(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/stories/")
+	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	if len(parts) == 2 && parts[1] == "animation" {
+		s.handleAdminStoryAnimation(w, r, parts[0])
+		return
+	}
+	s.handleAdminDeleteStory(w, r)
+}
+
+// POST/DELETE /api/v1/admin/stories/:id/animation — 1 对 1 专属奖励动画安全流式上传与删除
+// 失败时序保证：
+// - POST: 每次使用唯一文件名写入临时文件 -> 重命名落盘（不覆盖旧文件） -> 更新 DB -> DB 失败则回滚删新文件，DB 成功后再清理旧文件
+// - DELETE: 先更新 DB 清空 animation_url -> DB 失败不删文件，DB 成功后再清理磁盘文件
+func (s *Server) handleAdminStoryAnimation(w http.ResponseWriter, r *http.Request, storyID string) {
+	if err := content.ValidateSafeIdentifier("story_id", storyID); err != nil {
+		writeError(w, http.StatusBadRequest, "valid story_id required")
+		return
+	}
+
+	var existingTitle string
+	err := s.db.QueryRowContext(
+		r.Context(),
+		"SELECT title FROM stories WHERE id = ? AND status != 'deleted'",
+		storyID,
+	).Scan(&existingTitle)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "story not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	storyDir := filepath.Join(s.cfg.MediaDir(), "stories", storyID)
+
+	switch r.Method {
+	case http.MethodPost:
+		// 运行时复查外接盘挂载标记与磁盘空间（fail-closed）
+		if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+			writeError(w, statusCode, storageErr.Error())
+			return
+		}
+
+		maxBytes := s.maxUploadBytes()
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
+		memLimit := int64(8 << 20)
+		if maxBytes < memLimit {
+			memLimit = maxBytes
+		}
+		if err := r.ParseMultipartForm(memLimit); err != nil {
+			if isMaxBytesErr(err) {
+				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("animation exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+				return
+			}
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("parse multipart form: %v", err))
+			return
+		}
+		if r.MultipartForm != nil {
+			defer func() { _ = r.MultipartForm.RemoveAll() }()
+		}
+
+		file, header, err := r.FormFile("animation")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "missing 'animation' file field")
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		ext := strings.ToLower(filepath.Ext(header.Filename))
+		if !isAllowedAnimationExt(ext) {
+			writeError(w, http.StatusBadRequest, "unsupported animation format (allowed: .mp4, .webm, .gif, .webp)")
+			return
+		}
+
+		if err := os.MkdirAll(storyDir, 0o755); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// 先写入同目录临时文件
+		tmpFile, err := os.CreateTemp(storyDir, ".reward_upload_*.tmp")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create temp animation file: %v", err))
+			return
+		}
+		tmpPath := tmpFile.Name()
+		cleanupTmp := true
+		defer func() {
+			if cleanupTmp {
+				_ = os.Remove(tmpPath)
+			}
+		}()
+
+		written, copyErr := io.Copy(tmpFile, io.LimitReader(file, maxBytes+1))
+		if copyErr != nil {
+			_ = tmpFile.Close()
+			if isMaxBytesErr(copyErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("animation exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("save animation: %v", copyErr))
+			return
+		}
+		if written > maxBytes {
+			_ = tmpFile.Close()
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("animation exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+			return
+		}
+		if written == 0 {
+			_ = tmpFile.Close()
+			writeError(w, http.StatusBadRequest, "uploaded animation file is empty")
+			return
+		}
+		if err := tmpFile.Sync(); err != nil {
+			_ = tmpFile.Close()
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("sync animation file: %v", err))
+			return
+		}
+		if err := tmpFile.Close(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = os.Chmod(tmpPath, 0o644)
+
+		// 落盘提交前再次复查外接盘挂载状态
+		if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+			writeError(w, statusCode, storageErr.Error())
+			return
+		}
+
+		// 使用唯一新文件名提交，即使与旧动画同扩展名也绝不覆盖旧文件
+		targetName := newRewardAnimationFilename(ext)
+		targetPath := filepath.Join(storyDir, targetName)
+		if err := os.Rename(tmpPath, targetPath); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("commit animation file: %v", err))
+			return
+		}
+		cleanupTmp = false
+
+		mediaURL := fmt.Sprintf("/media/stories/%s/%s", storyID, targetName)
+		if _, err := s.db.ExecContext(r.Context(), "UPDATE stories SET animation_url = ? WHERE id = ?", mediaURL, storyID); err != nil {
+			// DB 更新失败：立即回滚删除新文件，旧文件与旧数据库记录完好无损
+			_ = os.Remove(targetPath)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// DB 更新成功后，再清理旧动画文件
+		removeOtherRewardAnimations(storyDir, targetName)
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"story_id":      storyID,
+			"title":         existingTitle,
+			"animation_url": mediaURL,
+		})
+
+	case http.MethodDelete:
+		// 删除仅需确认外接盘在位（允许磁盘空间不足时删除以释放空间）
+		if statusCode, storageErr := s.verifyDiskMountedOnly(); storageErr != nil {
+			writeError(w, statusCode, storageErr.Error())
+			return
+		}
+		// 严格先写数据库，再删磁盘文件；若数据库更新失败则保留磁盘文件
+		if _, err := s.db.ExecContext(r.Context(), "UPDATE stories SET animation_url = '' WHERE id = ?", storyID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		removeExistingRewardAnimations(storyDir)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"story_id":          storyID,
+			"deleted_animation": true,
+		})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *Server) handleAdminDeleteStory(w http.ResponseWriter, r *http.Request) {
@@ -728,7 +1082,6 @@ func (s *Server) handleAdminDeleteStory(w http.ResponseWriter, r *http.Request) 
 		`, now, storyID)
 	}
 
-	// Clean up story media directory on external disk to reclaim storage space
 	storyMediaPath := filepath.Join(s.cfg.MediaDir(), "stories", storyID)
 	if !strings.Contains(storyID, "..") {
 		_ = os.RemoveAll(storyMediaPath)
@@ -741,7 +1094,6 @@ func (s *Server) handleAdminDeleteStory(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// POST /api/v1/admin/quick-story (Zero-CLI online story creation/updating + automatic text-free SVG scene generation)
 func (s *Server) handleAdminQuickStory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -873,7 +1225,6 @@ func (s *Server) handleAdminQuickStory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /api/v1/admin/auto-generate-story (One-click full-automatic story + illustration generation + optional publishing)
 func (s *Server) handleAdminAutoGenerateStory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1019,16 +1370,17 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT s.id, s.title, COALESCE(s.theme, ''), COALESCE(s.description, ''), COALESCE(s.cover_url, ''),
+		       COALESCE(s.animation_url, ''), COALESCE(s.created_at, ''),
 		       sv.id AS version_id, sv.version_number,
 		       (SELECT COUNT(*) FROM story_sentences ss WHERE ss.version_id = sv.id) AS sentence_count
 		FROM stories s
 		JOIN story_versions sv ON sv.story_id = s.id
 		WHERE s.status = 'published' AND sv.status = 'published'
 		  AND sv.version_number = (
-		      SELECT MAX(sv2.version_number) FROM story_versions sv2
-		      WHERE sv2.story_id = s.id AND sv2.status = 'published'
+			SELECT MAX(sv2.version_number) FROM story_versions sv2
+			WHERE sv2.story_id = s.id AND sv2.status = 'published'
 		  )
-		ORDER BY s.created_at ASC
+		ORDER BY s.created_at DESC
 	`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1042,6 +1394,8 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 		Theme             string `json:"theme"`
 		Description       string `json:"description"`
 		CoverURL          string `json:"cover_url"`
+		AnimationURL      string `json:"animation_url,omitempty"`
+		CreatedAt         string `json:"created_at,omitempty"`
 		LatestVersionID   string `json:"latest_version_id"`
 		VersionNumber     int    `json:"version_number"`
 		SentenceCount     int    `json:"sentence_count"`
@@ -1054,7 +1408,11 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 	list := []storyItem{}
 	for rows.Next() {
 		var st storyItem
-		if err := rows.Scan(&st.ID, &st.Title, &st.Theme, &st.Description, &st.CoverURL, &st.LatestVersionID, &st.VersionNumber, &st.SentenceCount); err != nil {
+		if err := rows.Scan(
+			&st.ID, &st.Title, &st.Theme, &st.Description, &st.CoverURL,
+			&st.AnimationURL, &st.CreatedAt,
+			&st.LatestVersionID, &st.VersionNumber, &st.SentenceCount,
+		); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1103,14 +1461,15 @@ func (s *Server) handleStoryVersionDetail(w http.ResponseWriter, r *http.Request
 	}
 	storyID, versionID := parts[0], parts[2]
 
-	var title, theme, desc, coverURL string
+	var title, theme, desc, coverURL, animationURL string
 	var versionNum int
 	err := s.db.QueryRowContext(r.Context(), `
-		SELECT s.title, COALESCE(s.theme, ''), COALESCE(s.description, ''), COALESCE(s.cover_url, ''), sv.version_number
+		SELECT s.title, COALESCE(s.theme, ''), COALESCE(s.description, ''), COALESCE(s.cover_url, ''),
+		       COALESCE(s.animation_url, ''), sv.version_number
 		FROM stories s
 		JOIN story_versions sv ON sv.story_id = s.id
 		WHERE s.id = ? AND sv.id = ?
-	`, storyID, versionID).Scan(&title, &theme, &desc, &coverURL, &versionNum)
+	`, storyID, versionID).Scan(&title, &theme, &desc, &coverURL, &animationURL, &versionNum)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "story version not found")
@@ -1225,6 +1584,7 @@ func (s *Server) handleStoryVersionDetail(w http.ResponseWriter, r *http.Request
 		"theme":          theme,
 		"description":    desc,
 		"cover_url":      coverURL,
+		"animation_url":  animationURL,
 		"sentences":      sentences,
 	})
 }
@@ -1330,8 +1690,6 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 只要退出阅读界面（无论是读完点“读完啦” finished，还是中途点“保存并返回书架” user_exit），
-	// 都立即在后台根据目前已读句子的点字记录，重新计算遗忘曲线并同步到 GitHub Gist
 	isExitingReader := payload.SessionStatus == "completed" ||
 		payload.SessionStatus == "abandoned" ||
 		payload.EndReason == "user_exit" ||
@@ -1344,7 +1702,6 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// syncSessionPromptToGist 根据退出阅读时的 sessionID 查出 child_id，生成最新提示词并覆盖更新至 Gist
 func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -1417,7 +1774,6 @@ func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason str
 	defer func() { _ = resp.Body.Close() }()
 }
 
-// StartDailyStorySyncWorker 每天凌晨 3 点（东八区时间）自动从 GitHub Gist 固定地址读取新故事与配图并防重复入库
 func (s *Server) StartDailyStorySyncWorker() {
 	go func() {
 		loc := time.FixedZone("CST", 8*3600)
@@ -1433,20 +1789,29 @@ func (s *Server) StartDailyStorySyncWorker() {
 	}()
 }
 
+type gistRewardAnimation struct {
+	URL       string `json:"url"`
+	Title     string `json:"title"`
+	MediaType string `json:"media_type"`
+	Poster    string `json:"poster"`
+}
+
 type gistStoryPayload struct {
-	Version     string   `json:"version"`
-	StoryID     string   `json:"story_id"`
-	Title       string   `json:"title"`
-	Theme       string   `json:"theme"`
-	Description string   `json:"description"`
-	RawText     string   `json:"raw_text"`
-	Sentences   []string `json:"sentences"`
-	ImageURLs   []string `json:"image_urls"`
-	Images      []string `json:"images"`
+	Version         string               `json:"version"`
+	StoryID         string               `json:"story_id"`
+	Title           string               `json:"title"`
+	Theme           string               `json:"theme"`
+	Description     string               `json:"description"`
+	RawText         string               `json:"raw_text"`
+	Sentences       []string             `json:"sentences"`
+	ImageURLs       []string             `json:"image_urls"`
+	Images          []string             `json:"images"`
+	AnimationURL    string               `json:"animation_url"`
+	RewardAnimation *gistRewardAnimation `json:"reward_animation"`
 }
 
 type gistImportResult struct {
-	Status            string   `json:"status"` // "imported" or "already_imported"
+	Status            string   `json:"status"`
 	Version           string   `json:"version"`
 	ImportedStoryID   string   `json:"imported_story_id,omitempty"`
 	ImportedVersionID string   `json:"imported_version_id,omitempty"`
@@ -1460,6 +1825,7 @@ type gistImportResult struct {
 	ImageCount        int      `json:"image_count"`
 	LinesPerImage     string   `json:"lines_per_image"`
 	CoverURL          string   `json:"cover_url,omitempty"`
+	AnimationURL      string   `json:"animation_url,omitempty"`
 	ImageURLs         []string `json:"image_urls,omitempty"`
 	Source            string   `json:"source"`
 }
@@ -1504,8 +1870,6 @@ func parseGistStoryContent(contentStr string) (gistStoryPayload, bool) {
 	return gistStoryPayload{}, false
 }
 
-// isBlockedOrPrivateIP checks whether an IP address belongs to loopback, link-local, RFC1918 private,
-// CGNAT (100.64.0.0/10, including Tailscale), cloud metadata (169.254.169.254), IPv6 ULA (fc00::/7), or multicast ranges.
 func isBlockedOrPrivateIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -1514,17 +1878,14 @@ func isBlockedOrPrivateIP(ip net.IP) bool {
 		return true
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		// 100.64.0.0/10 (Carrier-Grade NAT / Tailscale)
 		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 			return true
 		}
-		// 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, >=224.0.0.0
 		if ip4[0] == 0 || ip4[0] == 127 || (ip4[0] == 169 && ip4[1] == 254) || ip4[0] >= 224 {
 			return true
 		}
 		return false
 	}
-	// IPv6 Unique Local Addresses fc00::/7
 	if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
 		return true
 	}
@@ -1562,8 +1923,6 @@ func validatePublicRemoteImageURL(rawURL string, allowLoopback bool) (*url.URL, 
 	return parsed, nil
 }
 
-// newSSRFProtectedImageClient creates an HTTP client that verifies DNS-resolved IPs at dial time
-// and re-validates every redirect target to prevent SSRF and DNS rebinding attacks.
 func (s *Server) newSSRFProtectedImageClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	transport := &http.Transport{
@@ -1588,11 +1947,11 @@ func (s *Server) newSSRFProtectedImageClient() *http.Client {
 		},
 	}
 	return &http.Client{
-		Timeout:   25 * time.Second,
+		Timeout:   45 * time.Second,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
-				return errors.New("too many redirects when fetching image")
+				return errors.New("too many redirects when fetching remote media")
 			}
 			_, err := validatePublicRemoteImageURL(req.URL.String(), s.allowLoopbackImageFetch)
 			return err
@@ -1600,9 +1959,90 @@ func (s *Server) newSSRFProtectedImageClient() *http.Client {
 	}
 }
 
-// pullAndImportStoryFromGist 优先通过零 CDN 缓存的 GitHub Gist API (https://api.github.com/gists/<id>) 读取新故事与配图，
-// 严格校验 story_id 与外部图片 URL（防路径穿越与 SSRF），并按图片数与总行数公式 idx*len(images)/len(sentences) 将每张图平均分配绑定到多行故事内容。
+// downloadRemoteStoryAnimation 使用 SSRF 防护客户端流式下载远程动画到唯一新文件名（不覆盖旧文件）
+// 由调用方在 DB 更新成功后再清理旧动画；DB 更新失败则回滚删除新文件。
+func (s *Server) downloadRemoteStoryAnimation(ctx context.Context, imgClient *http.Client, storyID, rawAnimURL string) (mediaURL, targetName, targetPath string) {
+	rawAnimURL = strings.TrimSpace(rawAnimURL)
+	if rawAnimURL == "" {
+		return "", "", ""
+	}
+	if _, err := s.verifyStorageWritable(); err != nil {
+		return "", "", ""
+	}
+	parsedU, err := validatePublicRemoteImageURL(rawAnimURL, s.allowLoopbackImageFetch)
+	if err != nil {
+		return "", "", ""
+	}
+	ext := strings.ToLower(filepath.Ext(parsedU.Path))
+	if !isAllowedAnimationExt(ext) {
+		ext = ".mp4"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedU.String(), nil)
+	if err != nil {
+		return "", "", ""
+	}
+	req.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
+	req.Header.Set("User-Agent", "reader-gist-sync/1.0")
+	resp, err := imgClient.Do(req)
+	if err != nil {
+		return "", "", ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", ""
+	}
+
+	storyDir := filepath.Join(s.cfg.MediaDir(), "stories", storyID)
+	if err := os.MkdirAll(storyDir, 0o755); err != nil {
+		return "", "", ""
+	}
+
+	maxBytes := s.maxUploadBytes()
+	if maxBytes > 64*1024*1024 {
+		maxBytes = 64 * 1024 * 1024
+	}
+
+	tmpFile, err := os.CreateTemp(storyDir, ".reward_remote_*.tmp")
+	if err != nil {
+		return "", "", ""
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	written, copyErr := io.Copy(tmpFile, io.LimitReader(resp.Body, maxBytes+1))
+	syncErr := tmpFile.Sync()
+	closeErr := tmpFile.Close()
+	if copyErr != nil || syncErr != nil || closeErr != nil || written < 512 || written > maxBytes {
+		return "", "", ""
+	}
+	_ = os.Chmod(tmpPath, 0o644)
+
+	if _, err := s.verifyStorageWritable(); err != nil {
+		return "", "", ""
+	}
+
+	targetName = newRewardAnimationFilename(ext)
+	targetPath = filepath.Join(storyDir, targetName)
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		return "", "", ""
+	}
+	cleanupTmp = false
+
+	return fmt.Sprintf("/media/stories/%s/%s", storyID, targetName), targetName, targetPath
+}
+
 func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport bool) (*gistImportResult, error) {
+	// 入口处先校验外接盘挂载标记与磁盘空间（覆盖手动拉取与凌晨 3 点定时任务），防止外接盘缺失时写入路由器闪存
+	if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+		return nil, &httpStatusError{statusCode: statusCode, err: storageErr}
+	}
+
 	const gistID = "aa8591c33578eb903d881cd133ec8fc3"
 	githubToken := strings.TrimSpace(os.Getenv("GITHUB_GIST_TOKEN"))
 
@@ -1624,7 +2064,6 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		RawURL  string `json:"raw_url"`
 	}
 
-	// 1. 优先请求 GitHub Gist API 端点（零 CDN 缓存，实时获取最新文件内容）
 	apiURL := fmt.Sprintf("%s/gists/%s?t=%d", apiBase, gistID, time.Now().UnixNano())
 	if apiReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil); err == nil {
 		apiReq.Header.Set("Accept", "application/vnd.github+json")
@@ -1668,7 +2107,6 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		}
 	}
 
-	// 2. 若 GitHub API 未命中或受限，回退到带纳秒时间戳与禁缓存 Header 的 Raw 链接
 	if !parsedOK {
 		candidates := []string{
 			rawBase + "/next_story.json",
@@ -1704,7 +2142,6 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		return nil, errors.New("Gist 中暂未找到有效的新故事 JSON（请确认 Gist 中已上传包含 title 与 sentences/raw_text 的 next_story.json）")
 	}
 
-	// 严格验证 Gist 传入的 story_id，拒绝任何路径穿越字符（如 ../ 或 /）
 	storyID := strings.TrimSpace(payload.StoryID)
 	if storyID == "" {
 		storyID = newID("story")
@@ -1727,16 +2164,16 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 	versionTag := "[GistVersion:" + verStr + "]"
 
 	if !forceImport {
-		var existingID, existingTitle, existingVersionID string
+		var existingID, existingTitle, existingVersionID, existingAnimURL string
 		err := s.db.QueryRowContext(ctx, `
-			SELECT s.id, s.title, COALESCE(
+			SELECT s.id, s.title, COALESCE(s.animation_url, ''), COALESCE(
 				(SELECT sv.id FROM story_versions sv WHERE sv.story_id = s.id AND sv.status = 'published' ORDER BY sv.version_number DESC LIMIT 1),
 				''
 			)
 			FROM stories s
 			WHERE s.description LIKE ? AND s.status != 'deleted'
 			LIMIT 1
-		`, "%"+versionTag+"%").Scan(&existingID, &existingTitle, &existingVersionID)
+		`, "%"+versionTag+"%").Scan(&existingID, &existingTitle, &existingAnimURL, &existingVersionID)
 		if err == nil && existingID != "" {
 			var existingImageURLs []string
 			if existingVersionID != "" {
@@ -1762,6 +2199,7 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 				RawText:           strings.Join(rawSentences, "\n"),
 				Sentences:         rawSentences,
 				SentenceCount:     len(rawSentences),
+				AnimationURL:      existingAnimURL,
 				ImageURLs:         existingImageURLs,
 				Source:            sourceUsed,
 			}, nil
@@ -1783,7 +2221,6 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 	nextVer := maxVer + 1
 	versionID := fmt.Sprintf("%s_v%d", storyID, nextVer)
 
-	// 使用带 SSRF 防护的 HTTP Client 下载外部章节配图（仅允许公网 HTTPS，禁止访问内网/环回/链路本地 IP）
 	imgClient := s.newSSRFProtectedImageClient()
 	var customImages []content.CustomImageUpload
 	for idx, rawImg := range imgLinks {
@@ -1794,7 +2231,6 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		fname := fmt.Sprintf("chapter_%02d.webp", idx)
 		var b64Data string
 
-		// 若传入的是同 Gist 下的文件名（如 "chapter_01.png"），优先从 Gist API 返回的 files 中提取
 		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "data:") && gistSiblingFiles != nil {
 			if sib, exists := gistSiblingFiles[u]; exists {
 				if strings.TrimSpace(sib.RawURL) != "" {
@@ -1843,6 +2279,11 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 				DataBase64: b64Data,
 			})
 		}
+	}
+
+	// 写入图片和故事数据前再次复查外接盘挂载标记与磁盘空间（防下载期间掉盘误写闪存）
+	if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+		return nil, &httpStatusError{statusCode: statusCode, err: storageErr}
 	}
 
 	var imageURLs []string
@@ -1900,9 +2341,30 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		Sentences:     sentences,
 	}
 
+	if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+		return nil, &httpStatusError{statusCode: statusCode, err: storageErr}
+	}
 	if err := s.importer.SaveManifest(ctx, manifest); err != nil {
 		return nil, err
 	}
+
+	remoteAnimURL := strings.TrimSpace(payload.AnimationURL)
+	if payload.RewardAnimation != nil && strings.TrimSpace(payload.RewardAnimation.URL) != "" {
+		remoteAnimURL = strings.TrimSpace(payload.RewardAnimation.URL)
+	}
+	localAnimURL := ""
+	if remoteAnimURL != "" {
+		mediaURL, targetName, targetPath := s.downloadRemoteStoryAnimation(ctx, imgClient, manifest.StoryID, remoteAnimURL)
+		if mediaURL != "" {
+			if _, dbErr := s.db.ExecContext(ctx, "UPDATE stories SET animation_url = ? WHERE id = ?", mediaURL, manifest.StoryID); dbErr != nil {
+				_ = os.Remove(targetPath)
+			} else {
+				localAnimURL = mediaURL
+				removeOtherRewardAnimations(filepath.Join(s.cfg.MediaDir(), "stories", manifest.StoryID), targetName)
+			}
+		}
+	}
+
 	go s.precacheStoryVersionAudio(manifest.VersionID)
 
 	imgCount := len(customImages)
@@ -1930,22 +2392,25 @@ func (s *Server) pullAndImportStoryFromGist(ctx context.Context, forceImport boo
 		ImageCount:        imgCount,
 		LinesPerImage:     linesRatio,
 		CoverURL:          coverURL,
+		AnimationURL:      localAnimURL,
 		ImageURLs:         imageURLs,
 		Source:            sourceUsed,
 	}, nil
 }
 
-// fetchAndImportLatestStoryFromGist 供每天凌晨 3 点定时任务调用
 func (s *Server) fetchAndImportLatestStoryFromGist() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	_, _ = s.pullAndImportStoryFromGist(ctx, false)
 }
 
-// POST /api/v1/admin/gist-pull 手动从 GitHub Gist 零缓存拉取最新故事与配图并按行数平均分配绑定入库
 func (s *Server) handleAdminGistPull(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+		writeError(w, statusCode, storageErr.Error())
 		return
 	}
 	var req struct {
@@ -1958,6 +2423,11 @@ func (s *Server) handleAdminGistPull(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.pullAndImportStoryFromGist(ctx, req.Force)
 	if err != nil {
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) {
+			writeError(w, statusErr.statusCode, statusErr.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1969,19 +2439,22 @@ func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	freeMB, ok, err := s.cfg.CheckFreeDiskMB()
-	if err == nil && !ok {
-		writeError(w, http.StatusInsufficientStorage, fmt.Sprintf("free disk space (%d MB) is below minimum required (%d MB)", freeMB, s.cfg.MinFreeDiskMB))
+	if statusCode, storageErr := s.verifyStorageWritable(); storageErr != nil {
+		writeError(w, statusCode, storageErr.Error())
 		return
 	}
 
-	maxBytes := s.cfg.UploadMaxMB * 1024 * 1024
+	maxBytes := s.maxUploadBytes()
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 
 	contentType := r.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
 		var m content.StoryManifest
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			if isMaxBytesErr(err) {
+				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("manifest exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+				return
+			}
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid manifest json: %v", err))
 			return
 		}
@@ -1998,9 +2471,20 @@ func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseMultipartForm(16 * 1024 * 1024); err != nil {
+	memLimit := int64(16 << 20)
+	if maxBytes < memLimit {
+		memLimit = maxBytes
+	}
+	if err := r.ParseMultipartForm(memLimit); err != nil {
+		if isMaxBytesErr(err) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("package exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+			return
+		}
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse multipart form: %v", err))
 		return
+	}
+	if r.MultipartForm != nil {
+		defer func() { _ = r.MultipartForm.RemoveAll() }()
 	}
 	file, _, err := r.FormFile("package")
 	if err != nil {
@@ -2019,6 +2503,10 @@ func (s *Server) handleAdminImport(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := io.Copy(tmpFile, file); err != nil {
 		_ = tmpFile.Close()
+		if isMaxBytesErr(err) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("package exceeds maximum upload limit (%d MB)", s.cfg.UploadMaxMB))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write temp zip: %v", err))
 		return
 	}
@@ -2198,8 +2686,6 @@ func isPunctuationChar(ch string) bool {
 	return false
 }
 
-// isRealMediaAudio returns true only if audioURL points to an existing media file larger than 512 bytes
-// (filtering out the 266-byte silent ID3 placeholder files from legacy offline bundles).
 func (s *Server) isRealMediaAudio(audioURL string) bool {
 	u := strings.TrimSpace(audioURL)
 	if u == "" || !strings.HasPrefix(u, "/media/") {
@@ -2279,9 +2765,6 @@ func (s *Server) ensureTTSAudioCached(ctx context.Context, text string) (string,
 	return "", "", errors.New("tts upstream unavailable")
 }
 
-// precacheStoryVersionAudio downloads and caches MP3 pronunciation files on the external disk
-// for every sentence and unique character in the given story version, and writes their local
-// /media/audio/tts_<hash>.mp3 URLs directly into SQLite so reading requires zero network wait.
 func (s *Server) precacheStoryVersionAudio(versionID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
