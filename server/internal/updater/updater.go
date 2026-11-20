@@ -25,7 +25,7 @@ import (
 )
 
 // CurrentVersion is overridden at build time via -ldflags.
-var CurrentVersion = "v0.3.15"
+var CurrentVersion = "v0.3.16"
 
 var localHealthClient = &http.Client{
 	Timeout:   2 * time.Second,
@@ -79,11 +79,12 @@ type githubRelease struct {
 }
 
 type Updater struct {
-	cfg          *config.Config
-	httpClient   *http.Client
-	apiBaseURL   string
-	SkipSelfTest bool
-	applyMu      sync.Mutex
+	cfg           *config.Config
+	httpClient    *http.Client
+	apiBaseURL    string
+	githubBaseURL string
+	SkipSelfTest  bool
+	applyMu       sync.Mutex
 }
 
 func New(cfg *config.Config) *Updater {
@@ -92,7 +93,8 @@ func New(cfg *config.Config) *Updater {
 		httpClient: &http.Client{
 			Timeout: 90 * time.Second,
 		},
-		apiBaseURL: "https://api.github.com",
+		apiBaseURL:    "https://api.github.com",
+		githubBaseURL: "https://github.com",
 	}
 }
 
@@ -197,8 +199,18 @@ func (u *Updater) CheckUpdate(ctx context.Context, mirrorOverride string) (*Chec
 		}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
+		status := resp.StatusCode
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("GitHub API 返回 HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		_ = resp.Body.Close()
+		apiErr := fmt.Errorf("GitHub API 返回 HTTP %d: %s", status, strings.TrimSpace(string(body)))
+		if isGitHubRateLimitResponse(status, resp.Header, body) {
+			fallback, fallbackErr := u.checkUpdateFromReleaseFeed(ctx, repo, mirrorOverride)
+			if fallbackErr == nil {
+				return fallback, nil
+			}
+			return nil, fmt.Errorf("%v；GitHub 公共 Release 回退也失败: %w", apiErr, fallbackErr)
+		}
+		return nil, apiErr
 	}
 
 	var rel githubRelease
