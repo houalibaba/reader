@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"reader/server/internal/config"
 	"reader/server/internal/content"
@@ -601,12 +602,23 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	cstLoc := time.FixedZone("CST", 8*3600)
 	sevenDaysAgo := now.AddDate(0, 0, -7)
 	weeklyReadCount := 0
-	weeklyMinutes := 0
-	allMinutes := 0
+	var weeklyDwellMs int64
+	var allDwellMs int64
+	weeklyFallbackMins := 0
+	allFallbackMins := 0
 	var recentSessionsRev []sessionMetric
 
+	type rawSessRow struct {
+		id         string
+		title      string
+		startedStr string
+		endedStr   string
+		curIdx     int
+	}
+	var rawSessions []rawSessRow
+
 	sessRows, sessErr := s.db.QueryContext(ctx, `
-		SELECT COALESCE(s.title, ''), rs.started_at, COALESCE(rs.ended_at, ''), rs.current_sentence_index
+		SELECT rs.id, COALESCE(s.title, ''), rs.started_at, COALESCE(rs.ended_at, ''), rs.current_sentence_index
 		FROM reading_sessions rs
 		LEFT JOIN story_versions sv ON rs.story_version_id = sv.id
 		LEFT JOIN stories s ON sv.story_id = s.id
@@ -616,47 +628,70 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	`, childID)
 	if sessErr == nil {
 		for sessRows.Next() {
-			var stTitle, startedStr, endedStr string
-			var curIdx int
-			if err := sessRows.Scan(&stTitle, &startedStr, &endedStr, &curIdx); err != nil {
+			var r rawSessRow
+			if err := sessRows.Scan(&r.id, &r.title, &r.startedStr, &r.endedStr, &r.curIdx); err != nil {
 				continue
 			}
-			startT, okStart := parseSQLiteTime(startedStr)
-			if !okStart {
-				continue
+			rawSessions = append(rawSessions, r)
+		}
+		_ = sessRows.Close()
+	}
+
+	for _, r := range rawSessions {
+		startT, okStart := parseSQLiteTime(r.startedStr)
+		if !okStart {
+			continue
+		}
+		effMs, viewCount := s.computeSessionReadingMs(ctx, r.id)
+		mins := 0
+		if viewCount > 0 {
+			if effMs > 0 {
+				allDwellMs += effMs
+				if !startT.Before(sevenDaysAgo) {
+					weeklyDwellMs += effMs
+				}
+				mins = int(math.Round(float64(effMs) / 60000.0))
+				if mins < 1 {
+					mins = 1
+				}
 			}
-			mins := 0
-			if endT, okEnd := parseSQLiteTime(endedStr); okEnd && endT.After(startT) {
+		} else {
+			if endT, okEnd := parseSQLiteTime(r.endedStr); okEnd && endT.After(startT) {
 				diffMins := int(math.Round(endT.Sub(startT).Minutes()))
 				if diffMins >= 1 && diffMins <= 120 {
 					mins = diffMins
 				}
 			}
-			if mins <= 0 {
-				est := int(math.Round(float64(curIdx+1) * 0.6))
+			if mins <= 0 && r.curIdx > 0 {
+				est := int(math.Round(float64(r.curIdx+1) * 0.6))
 				if est < 1 {
 					est = 1
 				}
 				mins = est
 			}
-			allMinutes += mins
+			allFallbackMins += mins
 			if !startT.Before(sevenDaysAgo) {
-				weeklyReadCount++
-				weeklyMinutes += mins
+				weeklyFallbackMins += mins
 			}
+		}
+		if !startT.Before(sevenDaysAgo) {
+			weeklyReadCount++
+		}
+		if mins > 0 {
 			recentSessionsRev = append(recentSessionsRev, sessionMetric{
 				Date:    startT.In(cstLoc).Format("01-02"),
 				Minutes: mins,
-				Title:   stTitle,
+				Title:   r.title,
 			})
 		}
-		_ = sessRows.Close()
 	}
 
 	readingSessions := make([]sessionMetric, 0, len(recentSessionsRev))
 	for i := len(recentSessionsRev) - 1; i >= 0; i-- {
 		readingSessions = append(readingSessions, recentSessionsRev[i])
 	}
+	weeklyMinutes := int(math.Round(float64(weeklyDwellMs)/60000.0)) + weeklyFallbackMins
+	allMinutes := int(math.Round(float64(allDwellMs)/60000.0)) + allFallbackMins
 	totalReadMinutes := weeklyMinutes
 	if totalReadMinutes == 0 {
 		totalReadMinutes = allMinutes
@@ -1369,7 +1404,17 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 	childID := r.URL.Query().Get("child_id")
 
 	rows, err := s.db.QueryContext(r.Context(), `
-		SELECT s.id, s.title, COALESCE(s.theme, ''), COALESCE(s.description, ''), COALESCE(s.cover_url, ''),
+		SELECT s.id, s.title, COALESCE(s.theme, ''), COALESCE(s.description, ''),
+		       COALESCE(
+		           NULLIF((
+		               SELECT ss_img.image_url
+		               FROM story_sentences ss_img
+		               WHERE ss_img.version_id = sv.id AND COALESCE(TRIM(ss_img.image_url), '') != ''
+		               ORDER BY ss_img.sequence_index ASC
+		               LIMIT 1
+		           ), ''),
+		           COALESCE(s.cover_url, '')
+		       ) AS cover_url,
 		       COALESCE(s.animation_url, ''), COALESCE(s.created_at, ''),
 		       sv.id AS version_id, sv.version_number,
 		       (SELECT COUNT(*) FROM story_sentences ss WHERE ss.version_id = sv.id) AS sentence_count
@@ -2872,4 +2917,95 @@ func (s *Server) handleTTS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	http.ServeFile(w, r, cachePath)
+}
+
+func countReadableChars(text string) int {
+	n := 0
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			n++
+		}
+	}
+	return n
+}
+
+// computeEffectivePageReadingMs 按自定义规则计算单页有效阅读时长（毫秒）：
+// - 非标点字符每字基准 1 秒，标点不计时间
+// - 被点击过的字按“连点前两次加时间”：每个字前两次点击每次 +2 秒（第 1 次点击变为 3 秒，第 2 次变为 5 秒，第 3 次起不再加时）
+// - 扣除本页整句朗读音频播放时长后得到净阅读停留时长
+// - 净停留 > 基准上限：按基准上限计；净停留 < 基准上限一半：计 0
+func computeEffectivePageReadingMs(dwellMs, sentenceAudioMs int64, charCount, cappedCharClicks int) int64 {
+	targetMs := int64(charCount)*1000 + int64(cappedCharClicks)*2000
+	if targetMs <= 0 {
+		return 0
+	}
+	readingStayMs := dwellMs - sentenceAudioMs
+	if readingStayMs <= 0 {
+		return 0
+	}
+	if readingStayMs*2 < targetMs {
+		return 0
+	}
+	if readingStayMs > targetMs {
+		return targetMs
+	}
+	return readingStayMs
+}
+
+func (s *Server) computeSessionReadingMs(ctx context.Context, sessionID string) (int64, int) {
+	cappedClicksByView := make(map[string]int)
+	ceRows, ceErr := s.db.QueryContext(ctx, `
+		SELECT ce.sentence_view_id, ce.token_id, COUNT(*)
+		FROM character_events ce
+		JOIN sentence_views svw ON svw.id = ce.sentence_view_id
+		WHERE svw.session_id = ? AND ce.is_valid = 1
+		GROUP BY ce.sentence_view_id, ce.token_id
+	`, sessionID)
+	if ceErr == nil {
+		for ceRows.Next() {
+			var svID, tokID string
+			var cnt int
+			if err := ceRows.Scan(&svID, &tokID, &cnt); err != nil {
+				continue
+			}
+			if cnt > 2 {
+				cnt = 2
+			}
+			cappedClicksByView[svID] += cnt
+		}
+		_ = ceRows.Close()
+	}
+
+	svRows, svErr := s.db.QueryContext(ctx, `
+		SELECT svw.id,
+		       svw.dwell_time_ms,
+		       COALESCE(ss.text, ''),
+		       COALESCE((
+		           SELECT SUM(CASE WHEN ae.play_duration_ms > 0 THEN ae.play_duration_ms ELSE 0 END)
+		           FROM audio_events ae
+		           WHERE ae.sentence_view_id = svw.id AND ae.audio_type = 'sentence'
+		       ), 0) AS sentence_audio_ms
+		FROM sentence_views svw
+		LEFT JOIN story_sentences ss ON ss.id = svw.sentence_id
+		WHERE svw.session_id = ?
+	`, sessionID)
+	if svErr != nil {
+		return 0, 0
+	}
+	defer func() { _ = svRows.Close() }()
+
+	var totalEffectiveMs int64
+	viewCount := 0
+	for svRows.Next() {
+		var svID, text string
+		var dwellMs, sentenceAudioMs int64
+		if err := svRows.Scan(&svID, &dwellMs, &text, &sentenceAudioMs); err != nil {
+			continue
+		}
+		viewCount++
+		charCount := countReadableChars(text)
+		cappedClicks := cappedClicksByView[svID]
+		totalEffectiveMs += computeEffectivePageReadingMs(dwellMs, sentenceAudioMs, charCount, cappedClicks)
+	}
+	return totalEffectiveMs, viewCount
 }

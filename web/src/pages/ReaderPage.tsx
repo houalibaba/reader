@@ -29,17 +29,6 @@ function makeUUID(prefix: string): string {
 // 拼音与词语提示持续显示 10.5 秒
 const PINYIN_DISPLAY_DURATION_MS = 10500;
 
-function runViewTransition(updateFn: () => void) {
-  const prefersReduced =
-    typeof window !== 'undefined' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  if (!prefersReduced && typeof (document as any).startViewTransition === 'function') {
-    (document as any).startViewTransition(updateFn);
-  } else {
-    updateFn();
-  }
-}
-
 export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPageProps) {
   const [sentenceIndex, setSentenceIndex] = useState<number>(session.current_sentence_index || 0);
   const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
@@ -64,7 +53,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   const hiddenStartedAtRef = useRef<number | null>(null);
   const pageBgHiddenMsRef = useRef<number>(0);
   const lifecycleExitFlushedRef = useRef<boolean>(false);
-  const visitedIndicesRef = useRef<Set<number>>(new Set([session.current_sentence_index || 0]));
+  const visitedIndicesRef = useRef<Set<number>>(new Set());
   const highlightTimerRef = useRef<number | null>(null);
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
   const rewardDialogRef = useRef<HTMLDialogElement | null>(null);
@@ -130,7 +119,13 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     keepalive = false
   ) => {
     if (!currentSentence) return;
-    const totalElapsedMs = Math.max(0, Math.round(performance.now() - enteredAtPerfRef.current));
+    const nowPerf = performance.now();
+    const ongoingHiddenMs =
+      hiddenStartedAtRef.current !== null ? Math.max(0, nowPerf - hiddenStartedAtRef.current) : 0;
+    const totalElapsedMs = Math.max(
+      0,
+      Math.round(nowPerf - enteredAtPerfRef.current - ongoingHiddenMs)
+    );
     const exitedIso = new Date().toISOString();
     const isRevisit = visitedIndicesRef.current.has(sentenceIndex) && charEventsRef.current.length === 0;
 
@@ -271,7 +266,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     if (!isImageFullscreen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        runViewTransition(() => setIsImageFullscreen(false));
+        setIsImageFullscreen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -279,9 +274,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
   }, [isImageFullscreen]);
 
   const handleToggleFullscreen = (nextState?: boolean) => {
-    runViewTransition(() => {
-      setIsImageFullscreen((prev) => (typeof nextState === 'boolean' ? nextState : !prev));
-    });
+    setIsImageFullscreen((prev) => (typeof nextState === 'boolean' ? nextState : !prev));
   };
 
   const handleTokenClick = async (token: SentenceToken) => {
@@ -334,7 +327,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     recordCurrentPageActiveDuration();
     const prevIdx = sentenceIndex - 1;
     await flushCurrentSentenceView(prevIdx, 'active');
-    visitedIndicesRef.current.add(prevIdx);
+    visitedIndicesRef.current.add(sentenceIndex);
     setSentenceIndex(prevIdx);
   };
 
@@ -343,7 +336,7 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
     if (sentenceIndex < story.sentences.length - 1) {
       const nextIdx = sentenceIndex + 1;
       await flushCurrentSentenceView(nextIdx, 'active');
-      visitedIndicesRef.current.add(nextIdx);
+      visitedIndicesRef.current.add(sentenceIndex);
       setSentenceIndex(nextIdx);
     } else {
       lifecycleExitFlushedRef.current = true;
@@ -555,21 +548,21 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
         </section>
       </div>
 
-      {isImageFullscreen && (
-        <button
-          type="button"
-          class="reader-exit-fullscreen-pill"
-          onClick={() => handleToggleFullscreen(false)}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 14h6v6" />
-            <path d="M20 10h-6V4" />
-            <path d="M14 10l7-7" />
-            <path d="M3 21l7-7" />
-          </svg>
-          <span>显示文字</span>
-        </button>
-      )}
+      <button
+        type="button"
+        class="reader-exit-fullscreen-pill"
+        aria-hidden={!isImageFullscreen}
+        tabIndex={isImageFullscreen ? 0 : -1}
+        onClick={() => handleToggleFullscreen(false)}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 14h6v6" />
+          <path d="M20 10h-6V4" />
+          <path d="M14 10l7-7" />
+          <path d="M3 21l7-7" />
+        </svg>
+        <span>显示文字</span>
+      </button>
 
       <dialog
         ref={settingsDialogRef}
@@ -663,6 +656,10 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
                   setUnlockOutcome(null);
                   pageActiveMsRef.current = {};
                   interactionCountRef.current = 0;
+                  visitedIndicesRef.current = new Set();
+                  enteredAtPerfRef.current = performance.now();
+                  enteredAtIsoRef.current = new Date().toISOString();
+                  pageBgHiddenMsRef.current = 0;
                   setSentenceIndex(0);
                 }}
               >

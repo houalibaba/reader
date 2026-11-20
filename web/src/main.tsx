@@ -33,6 +33,7 @@ export function App() {
   const [newChildName, setNewChildName] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [openingStoryId, setOpeningStoryId] = useState<string | null>(null);
+  const [failedCoverIds, setFailedCoverIds] = useState<Record<string, boolean>>({});
 
   // 1 对 1 专属动画播放弹窗（仅在故事卡片上对该篇已解锁动画展示入口）
   const [playingStoryAnim, setPlayingStoryAnim] = useState<StoryRewardAnimation | null>(null);
@@ -268,53 +269,83 @@ export function App() {
           const hasResume = (st.resume_sentence_index || 0) > 0 && st.resume_sentence_index < st.sentence_count;
           const storyAnim = buildStoryRewardAnimation(st as any);
           const isAnimUnlocked = Boolean(storyAnim && unlockedStoryIds.has(st.id));
+          const hasCover = Boolean(st.cover_url && !failedCoverIds[st.id]);
 
           return (
             <article key={st.id} class="story-card">
-              <div class="story-badge-row">
-                <span class="story-card-badge">{st.theme || '趣味故事'}</span>
-                {idx === 0 && <span class="story-new-badge">新书</span>}
-              </div>
-              <h2 style={{ margin: 0, fontSize: '1.2rem' }}>{st.title}</h2>
-              {st.description && (
-                <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.94rem', lineHeight: 1.5 }}>
-                  {st.description}
-                </p>
-              )}
-              <div class="story-meta">
-                <span>共 {st.sentence_count} 页 · v{st.version_number}</span>
-                {st.review_char_count > 0 && (
-                  <span class="recommend-tag">含 {st.review_char_count} 个复习字</span>
+              <button
+                type="button"
+                class="story-cover-btn"
+                disabled={isOpening}
+                onClick={() => void handleOpenStory(st, false)}
+                aria-label={`打开《${st.title}》`}
+              >
+                <div class="story-cover-frame">
+                  {hasCover ? (
+                    <img
+                      src={st.cover_url}
+                      alt={`《${st.title}》封面`}
+                      class="story-cover-img"
+                      loading={idx < 2 ? 'eager' : 'lazy'}
+                      decoding={idx < 2 ? 'sync' : 'async'}
+                      fetchpriority={idx === 0 ? 'high' : 'auto'}
+                      onError={() =>
+                        setFailedCoverIds((prev) => (prev[st.id] ? prev : { ...prev, [st.id]: true }))
+                      }
+                    />
+                  ) : (
+                    <div class="story-cover-placeholder" aria-hidden="true">
+                      <span class="story-cover-placeholder-icon">📖</span>
+                      <span class="story-cover-placeholder-title">{st.title}</span>
+                    </div>
+                  )}
+                  <div class="story-cover-badges">
+                    <span class="story-card-badge">{st.theme || '趣味故事'}</span>
+                    {idx === 0 && <span class="story-new-badge">新书</span>}
+                  </div>
+                </div>
+              </button>
+
+              <div class="story-card-body">
+                <h2 class="story-card-title">{st.title}</h2>
+                {st.description && (
+                  <p class="story-card-desc">{st.description}</p>
                 )}
-              </div>
-              <div style={{ display: 'flex', gap: '8px', marginTop: 'auto', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  class="btn-primary"
-                  disabled={isOpening}
-                  onClick={() => void handleOpenStory(st, false)}
-                >
-                  {isOpening ? '打开中...' : hasResume ? `继续读（第 ${st.resume_sentence_index + 1} 页）` : '开始阅读'}
-                </button>
-                {hasResume && (
+                <div class="story-meta">
+                  <span>共 {st.sentence_count} 页 · v{st.version_number}</span>
+                  {st.review_char_count > 0 && (
+                    <span class="recommend-tag">含 {st.review_char_count} 个复习字</span>
+                  )}
+                </div>
+                <div class="story-actions">
                   <button
                     type="button"
-                    class="btn-secondary"
+                    class="btn-primary"
                     disabled={isOpening}
-                    onClick={() => void handleOpenStory(st, true)}
+                    onClick={() => void handleOpenStory(st, false)}
                   >
-                    从头读
+                    {isOpening ? '打开中...' : hasResume ? `继续读（第 ${st.resume_sentence_index + 1} 页）` : '开始阅读'}
                   </button>
-                )}
-                {isAnimUnlocked && storyAnim && (
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    onClick={() => setPlayingStoryAnim(storyAnim)}
-                  >
-                    🎬 看动画
-                  </button>
-                )}
+                  {hasResume && (
+                    <button
+                      type="button"
+                      class="btn-secondary"
+                      disabled={isOpening}
+                      onClick={() => void handleOpenStory(st, true)}
+                    >
+                      从头读
+                    </button>
+                  )}
+                  {isAnimUnlocked && storyAnim && (
+                    <button
+                      type="button"
+                      class="btn-secondary"
+                      onClick={() => setPlayingStoryAnim(storyAnim)}
+                    >
+                      🎬 看动画
+                    </button>
+                  )}
+                </div>
               </div>
             </article>
           );

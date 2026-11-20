@@ -25,7 +25,7 @@ import (
 )
 
 // CurrentVersion is overridden at build time via -ldflags.
-var CurrentVersion = "v0.3.14"
+var CurrentVersion = "v0.3.15"
 
 var localHealthClient = &http.Client{
 	Timeout:   2 * time.Second,
