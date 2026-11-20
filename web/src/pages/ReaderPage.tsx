@@ -531,17 +531,15 @@ export function ReaderPage({ session, story, showPinyinHint, onExit }: ReaderPag
             <button
               type="button"
               class="reader-fullscreen-btn"
-              disabled={!bgImageUrl}
-              onClick={() => handleToggleFullscreen(true)}
-              aria-label="全屏看图"
-              title="全屏看图"
+              onClick={handleNextSentence}
+              aria-label={sentenceIndex < story.sentences.length - 1 ? '下一页' : '完成阅读'}
+              title={sentenceIndex < story.sentences.length - 1 ? '下一页' : '完成阅读'}
             >
-              <span class="fullscreen-btn-label">全屏看图</span>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M8 3H5a2 2 0 0 0-2 2v3" />
-                <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
-                <path d="M3 16v3a2 2 0 0 0 2 2h3" />
-                <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+              <span class="fullscreen-btn-label">
+                {sentenceIndex < story.sentences.length - 1 ? '下一页' : '完成阅读'}
+              </span>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 18l6-6-6-6" />
               </svg>
             </button>
           </footer>

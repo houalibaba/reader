@@ -2931,11 +2931,11 @@ func countReadableChars(text string) int {
 
 // computeEffectivePageReadingMs 按自定义规则计算单页有效阅读时长（毫秒）：
 // - 非标点字符每字基准 1 秒，标点不计时间
-// - 被点击过的字按“连点前两次加时间”：每个字前两次点击每次 +2 秒（第 1 次点击变为 3 秒，第 2 次变为 5 秒，第 3 次起不再加时）
+// - 被点击过的字按“连点前两次加时间”：每个字前两次点击每次 +6 秒（第 1 次点击变为 7 秒，第 2 次变为 13 秒，第 3 次起不再加时）
 // - 扣除本页整句朗读音频播放时长后得到净阅读停留时长
 // - 净停留 > 基准上限：按基准上限计；净停留 < 基准上限一半：计 0
 func computeEffectivePageReadingMs(dwellMs, sentenceAudioMs int64, charCount, cappedCharClicks int) int64 {
-	targetMs := int64(charCount)*1000 + int64(cappedCharClicks)*2000
+	targetMs := int64(charCount)*1000 + int64(cappedCharClicks)*6000
 	if targetMs <= 0 {
 		return 0
 	}
