@@ -166,7 +166,7 @@ def parse_iso_timestamp(ts_str: str) -> Optional[datetime]:
 def compute_forgetting_curve_metrics(record: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Computes Ebbinghaus Forgetting Curve retention R(t) = exp(-delta_t / S)
-    where S (stability in hours) grows with unhelped solo exposures and shrinks with click-help count.
+    using max(last_seen_at, last_help_at) and decaying old help penalties via post_help_unhelped.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -175,29 +175,36 @@ def compute_forgetting_curve_metrics(record: Dict[str, Any], now: Optional[datet
     helped_views = int(record.get("helped_view_count") or 0)
     help_count = int(record.get("help_count") or 0)
     unhelped_count = max(0, exp_count - helped_views)
+    post_help_unhelped = max(0, int(record.get("post_help_unhelped") or 0))
 
-    last_ts = parse_iso_timestamp(record.get("last_help_at") or "") or parse_iso_timestamp(
-        record.get("last_seen_at") or ""
-    )
-    if last_ts is not None:
-        elapsed_hours = max(0.25, (now - last_ts).total_seconds() / 3600.0)
+    seen_ts = parse_iso_timestamp(record.get("last_seen_at") or "")
+    help_ts = parse_iso_timestamp(record.get("last_help_at") or "")
+    candidates = [t for t in (seen_ts, help_ts) if t is not None]
+    if candidates:
+        elapsed_hours = max(0.25, (now - max(candidates)).total_seconds() / 3600.0)
     else:
-        elapsed_hours = 12.0 if help_count > 0 else 4.0
+        elapsed_hours = 12.0 if (help_count > 0 and post_help_unhelped == 0) else 4.0
 
-    # Ebbinghaus stability S (hours): base 18h, scales by 2.2^unhelped, penalized by help_count
-    stability_hours = (18.0 * (2.2 ** min(unhelped_count, 6))) / (1.0 + 0.85 * help_count)
+    graduated = help_count > 0 and post_help_unhelped >= 3
+    effective_help = 0.0
+    if help_count > 0:
+        effective_help = float(help_count) / (1.0 + 0.75 * float(post_help_unhelped))
+        if graduated and effective_help > 0.5:
+            effective_help = 0.5
+
+    stability_hours = (18.0 * (2.2 ** min(unhelped_count, 6))) / (1.0 + 0.85 * effective_help)
     retention = math.exp(-elapsed_hours / max(1.0, stability_hours))
-    if help_count > 2:
-        # High click-help count forces immediate forgetting-curve review priority
-        retention = min(retention, 0.45 / (1.0 + 0.15 * (help_count - 2)))
+    active_needs_support = (not graduated) and (effective_help > 2.0)
+    if active_needs_support:
+        retention = min(retention, 0.45 / (1.0 + 0.15 * (effective_help - 2.0)))
     elif exp_count < 3 and unhelped_count < 2:
         retention = min(retention, 0.72)
 
     retention_pct = max(5, min(99, int(round(retention * 100))))
-    urgency = (1.0 - retention) + 0.25 * help_count + (0.20 if exp_count < 3 else 0.0)
+    urgency = (1.0 - retention) + 0.25 * effective_help + (0.20 if exp_count < 3 else 0.0)
 
-    if help_count > 2:
-        stage = f"高频求助易错期（求助 {help_count} 次，记忆保留率 {retention_pct}%）"
+    if active_needs_support:
+        stage = f"高频求助易错期（累计求助 {help_count} 次，记忆保留率 {retention_pct}%）"
     elif retention < 0.60:
         stage = f"艾宾浩斯遗忘临界期（记忆保留率 {retention_pct}%）"
     elif exp_count < 3:
@@ -214,7 +221,34 @@ def compute_forgetting_curve_metrics(record: Dict[str, Any], now: Optional[datet
         "stability_hours": round(stability_hours, 1),
         "urgency": round(urgency, 3),
         "stage": stage,
+        "active_needs_support": active_needs_support,
     }
+
+
+def allocate_target_budget(
+    forgetting_review: List[Dict[str, Any]],
+    forgetting_observe: List[Dict[str, Any]],
+    total_budget: int = 10,
+    max_review: int = 7,
+    max_observe: int = 4,
+    max_new: int = 6,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Strictly caps review + observe + new_quota <= total_budget, prioritizing review first."""
+    remaining = max(0, int(total_budget))
+    safe_max_review = max(0, int(max_review))
+    safe_max_observe = max(0, int(max_observe))
+    safe_max_new = max(0, int(max_new))
+
+    rev_limit = min(len(forgetting_review), safe_max_review, remaining)
+    review_targets = list(forgetting_review[:rev_limit])
+    remaining -= rev_limit
+
+    obs_limit = min(len(forgetting_observe), safe_max_observe, remaining)
+    observe_targets = list(forgetting_observe[:obs_limit])
+    remaining -= obs_limit
+
+    new_quota = min(safe_max_new, remaining)
+    return review_targets, observe_targets, new_quota
 
 
 def fetch_vocabulary_from_api(server_url: str, child_id: str) -> List[Dict[str, Any]]:
@@ -257,11 +291,12 @@ def generate_vocabulary_plan(
             "urgency": fc["urgency"],
         }
 
-        if status == "needs_support" or (status == "likely_familiar" and fc["retention"] < 0.78):
+        exp_count = int(r.get("exposure_count") or 0)
+        if fc["active_needs_support"] or (exp_count >= 3 and fc["retention"] < 0.78):
             item["target_repetitions"] = 3
             item["reason"] = f"{fc['stage']}，需在 10 分钟故事不同章节自然复现 ≥3 次"
             forgetting_review_list.append(item)
-        elif status == "insufficient_evidence":
+        elif exp_count < 3:
             item["target_repetitions"] = 2
             item["reason"] = f"{fc['stage']}，需在故事中补充复现 ≥2 次以跨过遗忘拐点"
             forgetting_observe_list.append(item)
@@ -273,17 +308,21 @@ def generate_vocabulary_plan(
     forgetting_review_list.sort(key=lambda x: x["urgency"], reverse=True)
     forgetting_observe_list.sort(key=lambda x: x["urgency"], reverse=True)
 
-    review_targets = forgetting_review_list[:max_review_chars]
-    observe_targets = forgetting_observe_list[:max_observe_chars]
-
-    # Scientific 10-minute reading unfamiliar character budget (~10 distinct unfamiliar/review chars total)
     total_budget = TEN_MIN_READING_CONFIG["target_unfamiliar_char_budget"]
-    forgetting_curve_count = len(review_targets) + len(observe_targets)
-    scientific_new_quota = max(3, min(max_new_chars, total_budget - forgetting_curve_count))
+    review_targets, observe_targets, scientific_new_quota = allocate_target_budget(
+        forgetting_review_list,
+        forgetting_observe_list,
+        total_budget=total_budget,
+        max_review=max_review_chars,
+        max_observe=max_observe_chars,
+        max_new=max_new_chars,
+    )
 
     new_candidates: List[Dict[str, Any]] = []
     added_new_set = set()
     for ch, py, sample_word in COMMON_STARTER_CHARS:
+        if len(new_candidates) >= scientific_new_quota:
+            break
         if len(ch) != 1:
             continue
         if ch not in seen_chars and ch not in scaffold_chars and ch not in added_new_set:
@@ -429,37 +468,42 @@ def auto_generate_story_from_plan(
         new_words.extend(t.get("recommended_words") or [t["character"]])
 
     if llm_api_key and llm_api_url:
-        try:
-            payload = {
-                "model": llm_model or "nvidia/nemotron-3-ultra-550b-a55b:free",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是一位专业的中文儿童分级阅读作家。请严格按照用户提供的【已掌握全部字词库】与【遗忘曲线+新字科学配比】要求，"
-                            "仅输出纯文本故事正文（每句一行，不要标题、序号或多余解释）。"
-                        ),
+        prompt_text = f"故事主题：{theme}\n" + plan["story_generation_prompt"]
+        last_llm_draft = None
+        for attempt in range(2):
+            try:
+                payload = {
+                    "model": llm_model or "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是一位专业的中文儿童分级阅读作家。请严格按照用户提供的【已掌握全部字词库】与【遗忘曲线+新字科学配比】要求，"
+                                "仅输出纯文本故事正文（每句一行，不要标题、序号或多余解释）。"
+                            ),
+                        },
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    "temperature": 0.7,
+                }
+                req = urllib.request.Request(
+                    llm_api_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {llm_api_key}",
                     },
-                    {"role": "user", "content": f"故事主题：{theme}\n" + plan["story_generation_prompt"]},
-                ],
-                "temperature": 0.7,
-            }
-            req = urllib.request.Request(
-                llm_api_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {llm_api_key}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=35) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                content_text = resp_data["choices"][0]["message"]["content"].strip()
-                sents = [s.strip() for s in content_text.splitlines() if s.strip()]
-                if len(sents) >= 3:
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=35) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    content_text = resp_data["choices"][0]["message"]["content"].strip()
+                    sents = [s.strip() for s in content_text.splitlines() if s.strip()]
+                    if not sents:
+                        break
+                    val = verify_draft_against_plan(sents, plan)
                     main_word = review_words[0] if review_words else "小熊"
-                    return {
+                    last_llm_draft = {
                         "title": f"关于{main_word}的{theme}故事",
                         "theme": theme,
                         "description": f"主题【{theme}】· 基于全部已掌握字词与遗忘曲线科学配比生成的 10 分钟分级故事。",
@@ -471,9 +515,20 @@ def auto_generate_story_from_plan(
                         "review_chars": review_chars,
                         "new_words": new_words,
                         "new_chars": new_chars,
+                        "validation": val,
                     }
-        except Exception:
-            pass
+                    if val["passed"]:
+                        return last_llm_draft
+                    prompt_text = (
+                        f"故事主题：{theme}\n"
+                        + plan["story_generation_prompt"]
+                        + "\n\n【上一次草稿未通过校验，请严格修正以下问题后重新输出完整故事】：\n- "
+                        + "\n- ".join(val["failure_reasons"])
+                    )
+            except Exception:
+                break
+        if last_llm_draft is not None:
+            return last_llm_draft
 
     w1 = review_words[0] if len(review_words) > 0 else "小河"
     w2 = review_words[1] if len(review_words) > 1 else w1
@@ -568,48 +623,111 @@ def auto_generate_story_from_plan(
         "review_chars": review_chars,
         "new_words": new_words,
         "new_chars": new_chars,
+        "validation": verify_draft_against_plan(sentences, plan),
     }
 
 
-def verify_draft_against_plan(sentences: List[str], plan: Dict[str, Any], max_sentence_len: int = 28) -> Dict[str, Any]:
-    full_text = "\n".join(sentences)
+def _count_han_chars(text: str) -> int:
+    return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+
+
+def verify_draft_against_plan(
+    sentences: List[str],
+    plan: Dict[str, Any],
+    max_sentence_len: int = 30,
+    min_sentences: int = 14,
+    max_sentences: int = 24,
+    min_han_chars: int = 260,
+    max_han_chars: int = 560,
+) -> Dict[str, Any]:
+    cleaned = [s.strip() for s in sentences if s and s.strip()]
+    full_text = "\n".join(cleaned)
     char_counts: Dict[str, int] = {}
-    for ch in full_text:
-        char_counts[ch] = char_counts.get(ch, 0) + 1
+    char_sentence_counts: Dict[str, int] = {}
+    for s in cleaned:
+        seen_in_sent = set()
+        for ch in s:
+            char_counts[ch] = char_counts.get(ch, 0) + 1
+            if ch not in seen_in_sent:
+                seen_in_sent.add(ch)
+                char_sentence_counts[ch] = char_sentence_counts.get(ch, 0) + 1
+    han_char_count = _count_han_chars(full_text)
 
-    missing_reviews = []
-    for item in plan.get("review_targets", []):
-        ch = item["character"]
-        target = int(item.get("target_repetitions", 3))
-        actual = char_counts.get(ch, 0)
-        if actual < target:
-            missing_reviews.append({"character": ch, "expected_min": target, "actual": actual})
+    invalid_plan_reasons: List[str] = []
 
-    missing_new_chars = []
-    for item in plan.get("new_candidates", []):
-        ch = item["character"]
-        target = int(item.get("target_repetitions", 3))
-        actual = char_counts.get(ch, 0)
-        if actual < target:
-            missing_new_chars.append({"character": ch, "expected_min": target, "actual": actual})
+    def _check_targets(items: List[Dict[str, Any]], default_min: int) -> List[Dict[str, Any]]:
+        missing = []
+        for item in items:
+            ch = item["character"]
+            raw_target = item.get("target_repetitions")
+            if raw_target is None or raw_target == "":
+                target = default_min
+            else:
+                try:
+                    parsed_target = int(raw_target)
+                except (TypeError, ValueError):
+                    invalid_plan_reasons.append(f"计划配置异常：目标字「{ch}」的 target_repetitions 无效（{raw_target!r}）")
+                    parsed_target = default_min
+                if parsed_target < 0:
+                    invalid_plan_reasons.append(f"计划配置异常：目标字「{ch}」的 target_repetitions 不能为负数（{parsed_target}）")
+                    target = default_min
+                elif parsed_target == 0:
+                    target = default_min
+                else:
+                    target = parsed_target
+            min_sents = min(2, target)
+            actual = char_counts.get(ch, 0)
+            actual_sents = char_sentence_counts.get(ch, 0)
+            if actual < target or actual_sents < min_sents:
+                missing.append({
+                    "character": ch,
+                    "expected_min": target,
+                    "actual": actual,
+                    "expected_sentences": min_sents,
+                    "actual_sentences": actual_sents,
+                })
+        return missing
+
+    missing_reviews = _check_targets(plan.get("review_targets", []), 3)
+    missing_observes = _check_targets(plan.get("observe_targets", []), 2)
+    missing_new_chars = _check_targets(plan.get("new_candidates", []), 3)
 
     overlong_sentences = []
-    for idx, s in enumerate(sentences):
+    for idx, s in enumerate(cleaned):
         if len(s) > max_sentence_len:
             overlong_sentences.append({"sentence_index": idx, "length": len(s), "text": s})
 
-    passed = (
-        (len(missing_reviews) == 0)
-        and (len(missing_new_chars) == 0)
-        and (len(overlong_sentences) == 0)
-        and (len(sentences) >= 3)
-    )
+    failure_reasons: List[str] = list(invalid_plan_reasons)
+    if len(cleaned) < min_sentences:
+        failure_reasons.append(f"句数不足（当前 {len(cleaned)} 句，需至少 {min_sentences} 句）")
+    if len(cleaned) > max_sentences:
+        failure_reasons.append(f"句数过多（当前 {len(cleaned)} 句，最多 {max_sentences} 句）")
+    if han_char_count < min_han_chars:
+        failure_reasons.append(f"汉字篇幅不足（当前 {han_char_count} 字，需至少 {min_han_chars} 字）")
+    if han_char_count > max_han_chars:
+        failure_reasons.append(f"汉字篇幅过长（当前 {han_char_count} 字，最多 {max_han_chars} 字）")
+    if missing_reviews:
+        failure_reasons.append(f"缺少 {len(missing_reviews)} 个复习目标字达标复现")
+    if missing_observes:
+        failure_reasons.append(f"缺少 {len(missing_observes)} 个观察目标字达标复现")
+    if missing_new_chars:
+        failure_reasons.append(f"缺少 {len(missing_new_chars)} 个拓展新字达标复现")
+    if overlong_sentences:
+        failure_reasons.append(f"有 {len(overlong_sentences)} 句话超过单句长度上限（{max_sentence_len} 字）")
+
     return {
-        "passed": passed,
-        "sentence_count": len(sentences),
+        "passed": len(failure_reasons) == 0,
+        "sentence_count": len(cleaned),
+        "han_char_count": han_char_count,
+        "min_sentences": min_sentences,
+        "max_sentences": max_sentences,
+        "min_han_chars": min_han_chars,
+        "max_han_chars": max_han_chars,
         "missing_review_targets": missing_reviews,
+        "missing_observe_targets": missing_observes,
         "missing_new_candidates": missing_new_chars,
         "overlong_sentences": overlong_sentences,
+        "failure_reasons": failure_reasons,
     }
 
 

@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Respon
 from fastapi.responses import JSONResponse
 
 from story_packager import generate_svg_illustration, segment_and_annotate
-from vocab_planner import auto_generate_story_from_plan, generate_vocabulary_plan
+from vocab_planner import auto_generate_story_from_plan, compute_forgetting_curve_metrics, generate_vocabulary_plan, verify_draft_against_plan
 
 MIN_VALID_DWELL_MS = 300
 MAX_VALID_DWELL_MS = 180000
@@ -110,6 +110,16 @@ class ReaderAppContext:
         return int(free_mb), free_mb >= self.min_free_disk_mb
 
 
+def parse_bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 def create_app(config_path: str) -> FastAPI:
     ctx = ReaderAppContext(config_path)
     app = FastAPI(title="Chinese Children Adaptive Reader API")
@@ -186,29 +196,81 @@ def create_app(config_path: str) -> FastAPI:
         with ctx.get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT character, pinyin, exposure_count, helped_view_count, help_count,
-                       COALESCE(last_help_at, ''), COALESCE(last_seen_at, ''), estimated_status
-                FROM vocabulary_view
-                WHERE child_id = ?
-                ORDER BY help_count DESC, exposure_count DESC
+                WITH token_views AS (
+                    SELECT
+                        st.character,
+                        st.pinyin,
+                        sv.id AS view_id,
+                        sv.entered_at,
+                        COUNT(CASE WHEN ce.is_valid = 1 THEN ce.id END) AS view_help_count,
+                        MAX(CASE WHEN ce.is_valid = 1 THEN ce.clicked_at END) AS view_last_help_at
+                    FROM sentence_views sv
+                    JOIN reading_sessions rs ON sv.session_id = rs.id
+                    JOIN story_sentences ss ON sv.sentence_id = ss.id
+                    JOIN sentence_tokens st ON st.sentence_id = ss.id
+                    LEFT JOIN character_events ce ON ce.sentence_view_id = sv.id AND ce.token_id = st.id
+                    WHERE rs.child_id = ?
+                      AND sv.is_valid = 1
+                      AND rs.mode = 'solo'
+                      AND rs.pinyin_hint_enabled = 0
+                    GROUP BY st.character, st.pinyin, sv.id, sv.entered_at
+                ),
+                char_agg AS (
+                    SELECT
+                        character,
+                        pinyin,
+                        COUNT(*) AS exposure_count,
+                        SUM(CASE WHEN view_help_count > 0 THEN 1 ELSE 0 END) AS helped_view_count,
+                        SUM(view_help_count) AS help_count,
+                        MAX(view_last_help_at) AS last_help_at,
+                        MAX(entered_at) AS last_seen_at
+                    FROM token_views
+                    GROUP BY character, pinyin
+                )
+                SELECT
+                    ca.character,
+                    ca.pinyin,
+                    ca.exposure_count,
+                    ca.helped_view_count,
+                    ca.help_count,
+                    COALESCE(ca.last_help_at, ''),
+                    COALESCE(ca.last_seen_at, ''),
+                    (
+                        SELECT COUNT(*)
+                        FROM token_views tv
+                        WHERE tv.character = ca.character
+                          AND tv.pinyin = ca.pinyin
+                          AND tv.view_help_count = 0
+                          AND (ca.last_help_at IS NULL OR julianday(tv.entered_at) > julianday(ca.last_help_at))
+                    ) AS post_help_unhelped
+                FROM char_agg ca
+                ORDER BY ca.help_count DESC, ca.exposure_count DESC
                 """,
                 (child_id,),
             ).fetchall()
+        vocab_items = []
+        for r in rows:
+            rec = {
+                "character": r[0],
+                "pinyin": r[1],
+                "exposure_count": r[2],
+                "helped_view_count": r[3],
+                "help_count": r[4],
+                "last_help_at": r[5],
+                "last_seen_at": r[6],
+                "post_help_unhelped": r[7],
+            }
+            fc = compute_forgetting_curve_metrics(rec)
+            if fc["active_needs_support"]:
+                rec["estimated_status"] = "needs_support"
+            elif rec["exposure_count"] < 3:
+                rec["estimated_status"] = "insufficient_evidence"
+            else:
+                rec["estimated_status"] = "likely_familiar"
+            vocab_items.append(rec)
         return {
             "child_id": child_id,
-            "vocabulary": [
-                {
-                    "character": r[0],
-                    "pinyin": r[1],
-                    "exposure_count": r[2],
-                    "helped_view_count": r[3],
-                    "help_count": r[4],
-                    "last_help_at": r[5],
-                    "last_seen_at": r[6],
-                    "estimated_status": r[7],
-                }
-                for r in rows
-            ],
+            "vocabulary": vocab_items,
         }
 
     @app.get("/api/v1/children/{child_id}/story-plan")
@@ -778,7 +840,7 @@ def create_app(config_path: str) -> FastAPI:
         body = await req.json()
         child_id = (body.get("child_id") or "").strip()
         theme = (body.get("theme") or "勇气与探索").strip()
-        auto_publish = bool(body.get("auto_publish"))
+        auto_publish = parse_bool_flag(body.get("auto_publish"))
 
         vocab_records = get_vocabulary(child_id)["vocabulary"] if child_id else []
         plan = generate_vocabulary_plan(vocab_records)
@@ -789,9 +851,17 @@ def create_app(config_path: str) -> FastAPI:
             llm_api_key=body.get("llm_api_key") or "",
             llm_model=body.get("llm_model") or "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
+        validation = draft.get("validation") or verify_draft_against_plan(draft.get("sentences") or [], plan)
+        draft["validation"] = validation
         draft["published"] = False
 
-        if auto_publish:
+        can_auto_publish = auto_publish
+        if can_auto_publish and (draft.get("generator") == "smart_template" or not validation.get("passed")):
+            can_auto_publish = False
+            draft["auto_publish_blocked"] = True
+            draft["auto_publish_reason"] = "草稿未通过完整度与目标字覆盖校验（或已降级为短模板），已保留为草稿，请审阅或重试后再发布"
+
+        if can_auto_publish:
             story_id = f"story_{uuid.uuid4().hex[:10]}"
             version_id = f"{story_id}_v1"
             sentences_manifest = []

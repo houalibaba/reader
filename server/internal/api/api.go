@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -31,6 +33,16 @@ import (
 	"reader/server/internal/media"
 	"reader/server/internal/updater"
 )
+
+type gistSyncStatus struct {
+	Version    int64  `json:"version,omitempty"`
+	SyncedAt   string `json:"synced_at,omitempty"`
+	Success    bool   `json:"success"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	Attempts   int    `json:"attempts,omitempty"`
+	Trigger    string `json:"trigger,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
 
 type Server struct {
 	cfg                     *config.Config
@@ -44,6 +56,11 @@ type Server struct {
 	gistAPIBaseURL          string
 	gistRawBaseURL          string
 	allowLoopbackImageFetch bool
+
+	gistSyncMu          sync.Mutex
+	lastGistSyncVersion int64
+	lastGistSyncStatus  gistSyncStatus
+	gistSyncBackoff     time.Duration
 }
 
 type httpStatusError struct {
@@ -85,6 +102,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/v1/admin/quick-story", s.requireGuardianPIN(s.handleAdminQuickStory))
 	mux.HandleFunc("/api/v1/admin/auto-generate-story", s.requireGuardianPIN(s.handleAdminAutoGenerateStory))
 	mux.HandleFunc("/api/v1/admin/gist-pull", s.requireGuardianPIN(s.handleAdminGistPull))
+	mux.HandleFunc("/api/v1/admin/gist-push-prompt", s.requireGuardianPIN(s.handleAdminGistPushPrompt))
 	mux.HandleFunc("/api/v1/admin/export", s.requireGuardianPIN(s.handleAdminExport))
 	mux.HandleFunc("/api/v1/admin/events/", s.requireGuardianPIN(s.handleAdminEventValidity))
 	mux.HandleFunc("/api/v1/admin/stories/", s.requireGuardianPIN(s.handleAdminStoriesSubroutes))
@@ -201,6 +219,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		diskErr = err.Error()
 	}
+	s.gistSyncMu.Lock()
+	gistStatus := s.lastGistSyncStatus
+	s.gistSyncMu.Unlock()
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
 		"version":          updater.CurrentVersion,
@@ -209,6 +231,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"disk_space_ok":    ok,
 		"min_free_disk_mb": s.cfg.MinFreeDiskMB,
 		"disk_error":       diskErr,
+		"gist_sync":        gistStatus,
 	})
 }
 
@@ -316,37 +339,12 @@ func (s *Server) handleChildSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 2 && parts[1] == "vocabulary" && r.Method == http.MethodGet {
-		rows, err := s.db.QueryContext(r.Context(), `
-			SELECT character, pinyin, exposure_count, helped_view_count, help_count, COALESCE(last_help_at, ''), estimated_status
-			FROM vocabulary_view
-			WHERE child_id = ?
-			ORDER BY help_count DESC, exposure_count DESC
-		`, childID)
+		stats, err := s.queryChildVocabularyStats(r.Context(), childID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		defer func() { _ = rows.Close() }()
-
-		type vocabItem struct {
-			Character       string `json:"character"`
-			Pinyin          string `json:"pinyin"`
-			ExposureCount   int    `json:"exposure_count"`
-			HelpedViewCount int    `json:"helped_view_count"`
-			HelpCount       int    `json:"help_count"`
-			LastHelpAt      string `json:"last_help_at"`
-			EstimatedStatus string `json:"estimated_status"`
-		}
-		items := []vocabItem{}
-		for rows.Next() {
-			var it vocabItem
-			if err := rows.Scan(&it.Character, &it.Pinyin, &it.ExposureCount, &it.HelpedViewCount, &it.HelpCount, &it.LastHelpAt, &it.EstimatedStatus); err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			items = append(items, it)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"child_id": childID, "vocabulary": items})
+		writeJSON(w, http.StatusOK, map[string]any{"child_id": childID, "vocabulary": stats})
 		return
 	}
 
@@ -444,7 +442,12 @@ func parseSQLiteTime(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func computeForgettingMetrics(expCount, helpedViews, helpCount int, lastHelp, lastSeen string, now time.Time) (float64, int, float64, string) {
+func isSingleHanChar(s string) bool {
+	runes := []rune(strings.TrimSpace(s))
+	return len(runes) == 1 && unicode.Is(unicode.Han, runes[0])
+}
+
+func computeForgettingMetrics(expCount, helpedViews, helpCount, postHelpUnhelped int, lastHelp, lastSeen string, now time.Time) (float64, int, float64, string, bool) {
 	if expCount < 1 {
 		expCount = 1
 	}
@@ -452,21 +455,44 @@ func computeForgettingMetrics(expCount, helpedViews, helpCount int, lastHelp, la
 	if unhelped < 0 {
 		unhelped = 0
 	}
+	if postHelpUnhelped < 0 {
+		postHelpUnhelped = 0
+	}
+
+	// 取 last_seen_at 与 last_help_at 中较新的时间作为遗忘曲线间隔起点，
+	// 避免历史曾求助过的字在最新独立阅读后仍按旧求助时间持续衰减。
 	elapsedHours := 4.0
-	if helpCount > 0 {
+	if helpCount > 0 && postHelpUnhelped == 0 {
 		elapsedHours = 12.0
 	}
+	var latestT time.Time
+	hasLatest := false
+	if t, ok := parseSQLiteTime(lastSeen); ok {
+		latestT = t
+		hasLatest = true
+	}
 	if t, ok := parseSQLiteTime(lastHelp); ok {
-		if h := now.Sub(t).Hours(); h > 0.25 {
+		if !hasLatest || t.After(latestT) {
+			latestT = t
+			hasLatest = true
+		}
+	}
+	if hasLatest {
+		if h := now.Sub(latestT).Hours(); h > 0.25 {
 			elapsedHours = h
 		} else {
 			elapsedHours = 0.25
 		}
-	} else if t, ok := parseSQLiteTime(lastSeen); ok {
-		if h := now.Sub(t).Hours(); h > 0.25 {
-			elapsedHours = h
-		} else {
-			elapsedHours = 0.25
+	}
+
+	// 历史求助惩罚随“上次求助后的独立无求助阅读次数”衰减；
+	// 后续独立读对 >= 3 次则从高频求助状态“毕业”，回归正常艾宾浩斯遗忘曲线周期复习。
+	graduated := helpCount > 0 && postHelpUnhelped >= 3
+	effectiveHelp := 0.0
+	if helpCount > 0 {
+		effectiveHelp = float64(helpCount) / (1.0 + 0.75*float64(postHelpUnhelped))
+		if graduated && effectiveHelp > 0.5 {
+			effectiveHelp = 0.5
 		}
 	}
 
@@ -474,13 +500,15 @@ func computeForgettingMetrics(expCount, helpedViews, helpCount int, lastHelp, la
 	if uCap > 6 {
 		uCap = 6
 	}
-	stability := (18.0 * math.Pow(2.2, float64(uCap))) / (1.0 + 0.85*float64(helpCount))
+	stability := (18.0 * math.Pow(2.2, float64(uCap))) / (1.0 + 0.85*effectiveHelp)
 	if stability < 1.0 {
 		stability = 1.0
 	}
 	retention := math.Exp(-elapsedHours / stability)
-	if helpCount > 2 {
-		capR := 0.45 / (1.0 + 0.15*float64(helpCount-2))
+
+	activeNeedsSupport := !graduated && effectiveHelp > 2.0
+	if activeNeedsSupport {
+		capR := 0.45 / (1.0 + 0.15*(effectiveHelp-2.0))
 		if retention > capR {
 			retention = capR
 		}
@@ -498,15 +526,15 @@ func computeForgettingMetrics(expCount, helpedViews, helpCount int, lastHelp, la
 		retPct = 99
 	}
 
-	urgency := (1.0 - retention) + 0.25*float64(helpCount)
+	urgency := (1.0 - retention) + 0.25*effectiveHelp
 	if expCount < 3 {
 		urgency += 0.20
 	}
 
 	var stage string
 	switch {
-	case helpCount > 2:
-		stage = fmt.Sprintf("高频求助易错期（求助 %d 次，记忆保留率 %d%%）", helpCount, retPct)
+	case activeNeedsSupport:
+		stage = fmt.Sprintf("高频求助易错期（累计求助 %d 次，记忆保留率 %d%%）", helpCount, retPct)
 	case retention < 0.60:
 		stage = fmt.Sprintf("艾宾浩斯遗忘临界期（记忆保留率 %d%%）", retPct)
 	case expCount < 3:
@@ -516,21 +544,262 @@ func computeForgettingMetrics(expCount, helpedViews, helpCount int, lastHelp, la
 	default:
 		stage = fmt.Sprintf("已稳固掌握（记忆保留率 %d%%）", retPct)
 	}
-	return retention, retPct, urgency, stage
+	return retention, retPct, urgency, stage, activeNeedsSupport
 }
 
-func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*childStoryPlanResult, error) {
+var gradedStarterPool = []struct{ Ch, Py, Word string }{
+	{"水", "shuǐ", "河水"}, {"火", "huǒ", "火把"}, {"山", "shān", "高山"}, {"木", "mù", "木桥"},
+	{"日", "rì", "日出"}, {"月", "yuè", "月亮"}, {"大", "dà", "大家"}, {"小", "xiǎo", "小熊"},
+	{"上", "shàng", "上面"}, {"下", "xià", "下面"}, {"左", "zuǒ", "左边"}, {"右", "yòu", "右边"},
+	{"风", "fēng", "春风"}, {"雨", "yǔ", "大雨"}, {"花", "huā", "花朵"}, {"草", "cǎo", "青草"},
+	{"鸟", "niǎo", "小鸟"}, {"鱼", "yú", "小鱼"}, {"石", "shí", "石头"}, {"光", "guāng", "星光"},
+	{"桥", "qiáo", "木桥"}, {"林", "lín", "森林"}, {"灯", "dēng", "红灯"}, {"宝", "bǎo", "宝石"},
+	{"船", "chuán", "飞船"}, {"海", "hǎi", "大海"}, {"星", "xīng", "星星"}, {"云", "yún", "白云"},
+	{"路", "lù", "小路"}, {"家", "jiā", "回家"}, {"土", "tǔ", "泥土"}, {"田", "tián", "田野"},
+	{"河", "hé", "小河"}, {"江", "jiāng", "江水"}, {"湖", "hú", "湖面"}, {"泉", "quán", "泉水"},
+	{"雪", "xuě", "白雪"}, {"雷", "léi", "雷声"}, {"电", "diàn", "闪电"}, {"虹", "hóng", "彩虹"},
+	{"口", "kǒu", "门口"}, {"耳", "ěr", "耳朵"}, {"目", "mù", "目光"}, {"手", "shǒu", "双手"},
+	{"足", "zú", "足球"}, {"头", "tóu", "石头"}, {"发", "fà", "头发"}, {"牙", "yá", "牙齿"},
+	{"心", "xīn", "开心"}, {"力", "lì", "力气"}, {"气", "qì", "空气"}, {"声", "shēng", "声音"},
+	{"爸", "bà", "爸爸"}, {"妈", "mā", "妈妈"}, {"爷", "yé", "爷爷"}, {"奶", "nǎi", "奶奶"},
+	{"哥", "gē", "哥哥"}, {"姐", "jiě", "姐姐"}, {"弟", "dì", "弟弟"}, {"妹", "mèi", "妹妹"},
+	{"友", "yǒu", "朋友"}, {"师", "shī", "老师"}, {"生", "shēng", "学生"}, {"王", "wáng", "国王"},
+	{"主", "zhǔ", "公主"}, {"士", "shì", "勇士"}, {"队", "duì", "队长"}, {"伴", "bàn", "伙伴"},
+	{"门", "mén", "大门"}, {"窗", "chuāng", "窗户"}, {"房", "fáng", "房子"}, {"屋", "wū", "木屋"},
+	{"床", "chuáng", "小床"}, {"桌", "zhuō", "桌子"}, {"椅", "yǐ", "椅子"}, {"书", "shū", "看书"},
+	{"笔", "bǐ", "画笔"}, {"纸", "zhǐ", "白纸"}, {"包", "bāo", "书包"}, {"衣", "yī", "衣服"},
+	{"帽", "mào", "帽子"}, {"鞋", "xié", "鞋子"}, {"伞", "sǎn", "雨伞"}, {"钟", "zhōng", "时钟"},
+	{"镜", "jìng", "镜子"}, {"箱", "xiāng", "宝箱"}, {"钥", "yào", "钥匙"}, {"匙", "shi", "钥匙"},
+	{"锁", "suǒ", "门锁"}, {"梯", "tī", "梯子"}, {"走", "zǒu", "行走"}, {"跑", "pǎo", "奔跑"},
+	{"跳", "tiào", "跳高"}, {"飞", "fēi", "飞翔"}, {"游", "yóu", "游泳"}, {"爬", "pá", "爬山"},
+	{"站", "zhàn", "站立"}, {"坐", "zuò", "坐下"}, {"躺", "tǎng", "躺下"}, {"睡", "shuì", "睡觉"},
+	{"醒", "xǐng", "醒来"}, {"起", "qǐ", "起床"}, {"吃", "chī", "吃饭"}, {"喝", "hē", "喝水"},
+	{"吹", "chuī", "吹风"}, {"吸", "xī", "呼吸"}, {"笑", "xiào", "微笑"}, {"哭", "kū", "哭泣"},
+	{"喊", "hǎn", "大喊"}, {"叫", "jiào", "叫声"}, {"唱", "chàng", "唱歌"}, {"问", "wèn", "提问"},
+	{"答", "dá", "回答"}, {"讲", "jiǎng", "讲故事"}, {"读", "dú", "读书"}, {"写", "xiě", "写字"},
+	{"画", "huà", "画画"}, {"算", "suàn", "计算"}, {"看", "kàn", "看见"}, {"望", "wàng", "遥望"},
+	{"盯", "dīng", "盯着"}, {"找", "zhǎo", "寻找"}, {"寻", "xún", "寻宝"}, {"藏", "cáng", "躲藏"},
+	{"躲", "duǒ", "躲避"}, {"追", "zhuī", "追赶"}, {"逃", "táo", "逃跑"}, {"抓", "zhuā", "抓住"},
+	{"拿", "ná", "拿着"}, {"抱", "bào", "拥抱"}, {"背", "bēi", "背着"}, {"扛", "káng", "扛起"},
+	{"推", "tuī", "推开"}, {"拉", "lā", "拉手"}, {"举", "jǔ", "举起"}, {"放", "fàng", "放下"},
+	{"扔", "rēng", "扔掉"}, {"接", "jiē", "接住"}, {"敲", "qiāo", "敲门"}, {"打", "dǎ", "打开"},
+	{"拍", "pāi", "拍手"}, {"挖", "wā", "挖洞"}, {"砍", "kǎn", "砍树"}, {"种", "zhòng", "种树"},
+	{"浇", "jiāo", "浇水"}, {"摘", "zhāi", "摘果"}, {"修", "xiū", "修理"}, {"建", "jiàn", "建造"},
+	{"搭", "dā", "搭桥"}, {"造", "zào", "制造"}, {"亮", "liàng", "点亮"}, {"灭", "miè", "熄灭"},
+	{"烧", "shāo", "燃烧"}, {"烤", "kǎo", "烤火"}, {"洗", "xǐ", "洗手"}, {"扫", "sǎo", "打扫"},
+	{"帮", "bāng", "帮忙"}, {"助", "zhù", "帮助"}, {"救", "jiù", "营救"}, {"护", "hù", "保护"},
+	{"红", "hóng", "红花"}, {"黄", "huáng", "金黄"}, {"蓝", "lán", "蔚蓝"}, {"绿", "lǜ", "绿叶"},
+	{"白", "bái", "白云"}, {"黑", "hēi", "黑夜"}, {"金", "jīn", "金色"}, {"银", "yín", "银河"},
+	{"彩", "cǎi", "彩色"}, {"明", "míng", "光明"}, {"暗", "àn", "黑暗"}, {"清", "qīng", "清澈"},
+	{"净", "jìng", "干净"}, {"美", "měi", "美丽"}, {"丽", "lì", "美丽"}, {"香", "xiāng", "花香"},
+	{"甜", "tián", "香甜"}, {"酸", "suān", "酸甜"}, {"苦", "kǔ", "辛苦"}, {"辣", "là", "火辣"},
+	{"冷", "lěng", "寒冷"}, {"热", "rè", "炎热"}, {"暖", "nuǎn", "温暖"}, {"凉", "liáng", "清凉"},
+	{"温", "wēn", "温和"}, {"柔", "róu", "柔和"}, {"软", "ruǎn", "柔软"}, {"硬", "yìng", "坚硬"},
+	{"轻", "qīng", "轻松"}, {"重", "zhòng", "沉重"}, {"快", "kuài", "快乐"}, {"慢", "màn", "慢慢"},
+	{"早", "zǎo", "早上"}, {"晚", "wǎn", "夜晚"}, {"新", "xīn", "新鲜"}, {"旧", "jiù", "破旧"},
+	{"高", "gāo", "高兴"}, {"低", "dī", "低头"}, {"长", "cháng", "长路"}, {"短", "duǎn", "短小"},
+	{"宽", "kuān", "宽广"}, {"窄", "zhǎi", "狭窄"}, {"深", "shēn", "深山"}, {"浅", "qiǎn", "浅水"},
+	{"远", "yuǎn", "远方"}, {"近", "jìn", "附近"}, {"圆", "yuán", "圆月"}, {"方", "fāng", "方块"},
+	{"尖", "jiān", "尖尖"}, {"平", "píng", "平安"}, {"稳", "wěn", "稳稳"}, {"险", "xiǎn", "危险"},
+	{"勇", "yǒng", "勇敢"}, {"敢", "gǎn", "勇敢"}, {"奇", "qí", "奇怪"}, {"牛", "niú", "小牛"},
+	{"羊", "yáng", "山羊"}, {"马", "mǎ", "小马"}, {"猪", "zhū", "小猪"}, {"狗", "gǒu", "小狗"},
+	{"猫", "māo", "小猫"}, {"兔", "tù", "白兔"}, {"熊", "xióng", "小熊"}, {"虎", "hǔ", "老虎"},
+	{"狮", "shī", "狮子"}, {"象", "xiàng", "大象"}, {"猴", "hóu", "猴子"}, {"鹿", "lù", "小鹿"},
+	{"狼", "láng", "大狼"}, {"狐", "hú", "狐狸"}, {"狸", "li", "狐狸"}, {"鸭", "yā", "小鸭"},
+	{"鹅", "é", "白鹅"}, {"鸡", "jī", "小鸡"}, {"鹰", "yīng", "老鹰"}, {"蛙", "wā", "青蛙"},
+	{"龟", "guī", "乌龟"}, {"蛇", "shé", "小蛇"}, {"龙", "lóng", "恐龙"}, {"虫", "chóng", "小虫"},
+	{"蜂", "fēng", "蜜蜂"}, {"蝶", "dié", "蝴蝶"}, {"蚁", "yǐ", "蚂蚁"}, {"虾", "xiā", "小虾"},
+	{"蟹", "xiè", "螃蟹"}, {"贝", "bèi", "贝壳"}, {"壳", "ké", "贝壳"}, {"树", "shù", "大树"},
+	{"叶", "yè", "树叶"}, {"根", "gēn", "树根"}, {"枝", "zhī", "树枝"}, {"竹", "zhú", "竹子"},
+	{"松", "sōng", "松树"}, {"柳", "liǔ", "柳树"}, {"桃", "táo", "桃子"}, {"果", "guǒ", "果子"},
+	{"瓜", "guā", "西瓜"}, {"豆", "dòu", "豆子"}, {"米", "mǐ", "大米"}, {"麦", "mài", "小麦"},
+	{"面", "miàn", "面包"}, {"糖", "táng", "糖果"}, {"奶", "nǎi", "牛奶"}, {"蛋", "dàn", "鸡蛋"},
+	{"肉", "ròu", "烤肉"}, {"块", "kuài", "方块"}, {"矿", "kuàng", "矿石"}, {"洞", "dòng", "山洞"},
+	{"穴", "xué", "洞穴"}, {"岩", "yán", "岩石"}, {"浆", "jiāng", "岩浆"}, {"沙", "shā", "沙滩"},
+	{"泥", "ní", "泥巴"}, {"铁", "tiě", "铁剑"}, {"铜", "tóng", "铜门"}, {"钻", "zuàn", "钻石"},
+	{"玉", "yù", "美玉"}, {"剑", "jiàn", "宝剑"}, {"盾", "dùn", "盾牌"}, {"弓", "gōng", "弓箭"},
+	{"箭", "jiàn", "射箭"}, {"甲", "jiǎ", "盔甲"}, {"旗", "qí", "红旗"}, {"鼓", "gǔ", "大鼓"},
+	{"号", "hào", "号角"}, {"车", "chē", "矿车"}, {"轮", "lún", "车轮"}, {"轨", "guǐ", "轨道"},
+	{"帆", "fān", "白帆"}, {"桨", "jiǎng", "船桨"}, {"岛", "dǎo", "海岛"}, {"岸", "àn", "对岸"},
+	{"谷", "gǔ", "山谷"}, {"坡", "pō", "山坡"}, {"顶", "dǐng", "山顶"}, {"底", "dǐ", "海底"},
+	{"崖", "yá", "悬崖"}, {"村", "cūn", "村庄"}, {"城", "chéng", "城堡"}, {"塔", "tǎ", "高塔"},
+	{"井", "jǐng", "水井"}, {"池", "chí", "水池"}, {"园", "yuán", "花园"}, {"场", "chǎng", "广场"},
+	{"市", "shì", "集市"}, {"信", "xìn", "信件"}, {"图", "tú", "地图"}, {"秘", "mì", "秘密"},
+	{"密", "mì", "密林"}, {"谜", "mí", "谜题"}, {"题", "tí", "问题"}, {"法", "fǎ", "办法"},
+	{"功", "gōng", "成功"}, {"胜", "shèng", "胜利"}, {"利", "lì", "顺利"}, {"希", "xī", "希望"},
+	{"梦", "mèng", "梦想"}, {"世", "shì", "世界"}, {"界", "jiè", "世界"}, {"探", "tàn", "探险"},
+}
+
+func buildScaffoldCharSet(raw string) map[string]bool {
+	set := make(map[string]bool)
+	for _, r := range raw {
+		if unicode.Is(unicode.Han, r) {
+			set[string(r)] = true
+		}
+	}
+	return set
+}
+
+// allocateTargetBudget enforces a strict total unfamiliar-character budget (e.g. 10),
+// prioritizing review targets first, then observe targets, and only allocating new characters
+// from remaining capacity (never exceeding totalBudget).
+type childVocabStat struct {
+	Character        string `json:"character"`
+	Pinyin           string `json:"pinyin"`
+	ExposureCount    int    `json:"exposure_count"`
+	HelpedViewCount  int    `json:"helped_view_count"`
+	HelpCount        int    `json:"help_count"`
+	LastHelpAt       string `json:"last_help_at"`
+	LastSeenAt       string `json:"last_seen_at"`
+	PostHelpUnhelped int    `json:"post_help_unhelped"`
+	EstimatedStatus  string `json:"estimated_status"`
+}
+
+func (s *Server) queryChildVocabularyStats(ctx context.Context, childID string) ([]childVocabStat, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT character, pinyin, exposure_count, helped_view_count, help_count,
-		       COALESCE(last_help_at, ''), COALESCE(last_seen_at, ''), estimated_status
-		FROM vocabulary_view
-		WHERE child_id = ?
-		ORDER BY help_count DESC, exposure_count DESC
+		WITH token_views AS (
+			SELECT
+				st.character,
+				st.pinyin,
+				sv.id AS view_id,
+				sv.entered_at,
+				COUNT(CASE WHEN ce.is_valid = 1 THEN ce.id END) AS view_help_count,
+				MAX(CASE WHEN ce.is_valid = 1 THEN ce.clicked_at END) AS view_last_help_at
+			FROM sentence_views sv
+			JOIN reading_sessions rs ON sv.session_id = rs.id
+			JOIN story_sentences ss ON sv.sentence_id = ss.id
+			JOIN sentence_tokens st ON st.sentence_id = ss.id
+			LEFT JOIN character_events ce ON ce.sentence_view_id = sv.id AND ce.token_id = st.id
+			WHERE rs.child_id = ?
+			  AND sv.is_valid = 1
+			  AND rs.mode = 'solo'
+			  AND rs.pinyin_hint_enabled = 0
+			GROUP BY st.character, st.pinyin, sv.id, sv.entered_at
+		),
+		char_agg AS (
+			SELECT
+				character,
+				pinyin,
+				COUNT(*) AS exposure_count,
+				SUM(CASE WHEN view_help_count > 0 THEN 1 ELSE 0 END) AS helped_view_count,
+				SUM(view_help_count) AS help_count,
+				MAX(view_last_help_at) AS last_help_at,
+				MAX(entered_at) AS last_seen_at
+			FROM token_views
+			GROUP BY character, pinyin
+		)
+		SELECT
+			ca.character,
+			ca.pinyin,
+			ca.exposure_count,
+			ca.helped_view_count,
+			ca.help_count,
+			COALESCE(ca.last_help_at, ''),
+			COALESCE(ca.last_seen_at, ''),
+			(
+				SELECT COUNT(*)
+				FROM token_views tv
+				WHERE tv.character = ca.character
+				  AND tv.pinyin = ca.pinyin
+				  AND tv.view_help_count = 0
+				  AND (ca.last_help_at IS NULL OR julianday(tv.entered_at) > julianday(ca.last_help_at))
+			) AS post_help_unhelped
+		FROM char_agg ca
+		ORDER BY ca.help_count DESC, ca.exposure_count DESC
 	`, childID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+
+	now := time.Now().UTC()
+	stats := []childVocabStat{}
+	for rows.Next() {
+		var st childVocabStat
+		if err := rows.Scan(
+			&st.Character, &st.Pinyin, &st.ExposureCount, &st.HelpedViewCount,
+			&st.HelpCount, &st.LastHelpAt, &st.LastSeenAt, &st.PostHelpUnhelped,
+		); err != nil {
+			continue
+		}
+		_, _, _, _, activeNeeds := computeForgettingMetrics(
+			st.ExposureCount, st.HelpedViewCount, st.HelpCount, st.PostHelpUnhelped,
+			st.LastHelpAt, st.LastSeenAt, now,
+		)
+		if activeNeeds {
+			st.EstimatedStatus = "needs_support"
+		} else if st.ExposureCount < 3 {
+			st.EstimatedStatus = "insufficient_evidence"
+		} else {
+			st.EstimatedStatus = "likely_familiar"
+		}
+		stats = append(stats, st)
+	}
+	return stats, nil
+}
+
+func allocateTargetBudget(
+	forgettingReview []planTarget,
+	forgettingObserve []planTarget,
+	totalBudget, maxReview, maxObserve, maxNew int,
+) ([]planTarget, []planTarget, int) {
+	if totalBudget < 0 {
+		totalBudget = 0
+	}
+	if maxReview < 0 {
+		maxReview = 0
+	}
+	if maxObserve < 0 {
+		maxObserve = 0
+	}
+	if maxNew < 0 {
+		maxNew = 0
+	}
+	remaining := totalBudget
+
+	revLimit := maxReview
+	if revLimit > remaining {
+		revLimit = remaining
+	}
+	if revLimit > len(forgettingReview) {
+		revLimit = len(forgettingReview)
+	}
+	if revLimit < 0 {
+		revLimit = 0
+	}
+	reviewTargets := make([]planTarget, revLimit)
+	copy(reviewTargets, forgettingReview[:revLimit])
+	remaining -= revLimit
+
+	obsLimit := maxObserve
+	if obsLimit > remaining {
+		obsLimit = remaining
+	}
+	if obsLimit > len(forgettingObserve) {
+		obsLimit = len(forgettingObserve)
+	}
+	if obsLimit < 0 {
+		obsLimit = 0
+	}
+	observeTargets := make([]planTarget, obsLimit)
+	copy(observeTargets, forgettingObserve[:obsLimit])
+	remaining -= obsLimit
+
+	newQuota := remaining
+	if newQuota > maxNew {
+		newQuota = maxNew
+	}
+	if newQuota < 0 {
+		newQuota = 0
+	}
+	return reviewTargets, observeTargets, newQuota
+}
+
+func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*childStoryPlanResult, error) {
+	stats, err := s.queryChildVocabularyStats(ctx, childID)
+	if err != nil {
+		return nil, err
+	}
 
 	var forgettingReview []planTarget
 	var forgettingObserve []planTarget
@@ -539,33 +808,34 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	now := time.Now().UTC()
 	totalTracked := 0
 
-	for rows.Next() {
-		var ch, py, lastHelp, lastSeen, status string
-		var expCount, helpedViews, helpCount int
-		if err := rows.Scan(&ch, &py, &expCount, &helpedViews, &helpCount, &lastHelp, &lastSeen, &status); err != nil {
+	for _, st := range stats {
+		if !isSingleHanChar(st.Character) {
 			continue
 		}
 		totalTracked++
-		seenChars[ch] = true
-		words := content.MatchWordsForCharPinyin(ch, py)
-		ret, retPct, urgency, stage := computeForgettingMetrics(expCount, helpedViews, helpCount, lastHelp, lastSeen, now)
+		seenChars[st.Character] = true
+		words := content.MatchWordsForCharPinyin(st.Character, st.Pinyin)
+		ret, retPct, urgency, stage, activeNeedsSupport := computeForgettingMetrics(
+			st.ExposureCount, st.HelpedViewCount, st.HelpCount, st.PostHelpUnhelped,
+			st.LastHelpAt, st.LastSeenAt, now,
+		)
 
 		item := planTarget{
-			Character:        ch,
-			Pinyin:           py,
-			HelpCount:        helpCount,
-			ExposureCount:    expCount,
+			Character:        st.Character,
+			Pinyin:           st.Pinyin,
+			HelpCount:        st.HelpCount,
+			ExposureCount:    st.ExposureCount,
 			RecommendedWords: words,
 			RetentionPct:     retPct,
 			ForgettingStage:  stage,
 			Urgency:          urgency,
 		}
 
-		if status == "needs_support" || (status == "likely_familiar" && ret < 0.78) {
+		if activeNeedsSupport || (st.ExposureCount >= 3 && ret < 0.78) {
 			item.TargetRepetitions = 3
 			item.Reason = fmt.Sprintf("%s，需在 10 分钟故事不同章节自然复现 ≥3 次", stage)
 			forgettingReview = append(forgettingReview, item)
-		} else if status == "insufficient_evidence" {
+		} else if st.ExposureCount < 3 {
 			item.TargetRepetitions = 2
 			item.Reason = fmt.Sprintf("%s，需在故事中补充复现 ≥2 次以跨过遗忘拐点", stage)
 			forgettingObserve = append(forgettingObserve, item)
@@ -579,20 +849,16 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 	sort.Slice(forgettingReview, func(i, j int) bool { return forgettingReview[i].Urgency > forgettingReview[j].Urgency })
 	sort.Slice(forgettingObserve, func(i, j int) bool { return forgettingObserve[i].Urgency > forgettingObserve[j].Urgency })
 
-	reviewTargets := forgettingReview
-	if len(reviewTargets) > 7 {
-		reviewTargets = reviewTargets[:7]
-	}
-	observeTargets := forgettingObserve
-	if len(observeTargets) > 4 {
-		observeTargets = observeTargets[:4]
-	}
-	if reviewTargets == nil {
-		reviewTargets = []planTarget{}
-	}
-	if observeTargets == nil {
-		observeTargets = []planTarget{}
-	}
+	totalBudget := 10
+	reviewTargets, observeTargets, newQuota := allocateTargetBudget(
+		forgettingReview,
+		forgettingObserve,
+		totalBudget,
+		7, // maxReview
+		4, // maxObserve
+		6, // maxNew
+	)
+	forgettingCount := len(reviewTargets) + len(observeTargets)
 
 	type sessionMetric struct {
 		Date    string `json:"date"`
@@ -697,50 +963,76 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 		totalReadMinutes = allMinutes
 	}
 
-	totalBudget := 10
-	forgettingCount := len(reviewTargets) + len(observeTargets)
-	newQuota := totalBudget - forgettingCount
-	if newQuota < 3 {
-		newQuota = 3
-	}
-	if newQuota > 6 {
-		newQuota = 6
-	}
+	scaffoldChars := buildScaffoldCharSet(foundationalScaffoldWords)
 
-	starterPool := []struct{ Ch, Py, Word string }{
-		{"水", "shuǐ", "河水"}, {"火", "huǒ", "火把"}, {"山", "shān", "高山"},
-		{"木", "mù", "木桥"}, {"日", "rì", "日出"}, {"月", "yuè", "月亮"},
-		{"大", "dà", "大家"}, {"小", "xiǎo", "小熊"}, {"上", "shàng", "上面"},
-		{"下", "xià", "下面"}, {"左", "zuǒ", "左边"}, {"右", "yòu", "右边"},
-		{"风", "fēng", "春风"}, {"雨", "yǔ", "大雨"}, {"花", "huā", "花朵"},
-		{"草", "cǎo", "青草"}, {"鸟", "niǎo", "小鸟"}, {"鱼", "yú", "小鱼"},
-		{"石", "shí", "石头"}, {"光", "guāng", "星光"}, {"桥", "qiáo", "木桥"},
-		{"林", "lín", "森林"}, {"灯", "dēng", "红灯"}, {"宝", "bǎo", "宝石"},
-		{"船", "chuán", "飞船"}, {"海", "hǎi", "大海"}, {"星", "xīng", "星星"},
-		{"云", "yún", "白云"}, {"路", "lù", "小路"}, {"家", "jiā", "回家"},
+	// 收集书架上已发布但孩子尚未读完的故事字集，避免连续生成多篇故事时反复推荐同一批拓展生字
+	unreadStoryChars := map[string]bool{}
+	unreadRows, unreadErr := s.db.QueryContext(ctx, `
+		SELECT DISTINCT st.character
+		FROM stories s
+		JOIN story_versions sv ON sv.story_id = s.id AND sv.status = 'published'
+		JOIN story_sentences ss ON ss.version_id = sv.id
+		JOIN sentence_tokens st ON st.sentence_id = ss.id
+		WHERE s.status = 'published'
+		  AND NOT EXISTS (
+			  SELECT 1 FROM reading_sessions rs
+			  WHERE rs.child_id = ?
+			    AND rs.story_version_id = sv.id
+			    AND rs.status = 'completed'
+		  )
+	`, childID)
+	if unreadErr == nil {
+		for unreadRows.Next() {
+			var ch string
+			if err := unreadRows.Scan(&ch); err == nil && isSingleHanChar(ch) {
+				unreadStoryChars[ch] = true
+			}
+		}
+		_ = unreadRows.Close()
 	}
 
 	newCandidates := []planTarget{}
-	for _, st := range starterPool {
-		if !seenChars[st.Ch] && len(newCandidates) < newQuota {
-			words := content.MatchWordsForCharPinyin(st.Ch, st.Py)
-			hasSample := false
-			for _, w := range words {
-				if w == st.Word {
-					hasSample = true
-					break
-				}
+	pickedNew := map[string]bool{}
+	appendCandidate := func(ch, py, sampleWord string) {
+		words := content.MatchWordsForCharPinyin(ch, py)
+		hasSample := false
+		for _, w := range words {
+			if w == sampleWord {
+				hasSample = true
+				break
 			}
-			if !hasSample {
-				words = append([]string{st.Word}, words...)
+		}
+		if !hasSample {
+			words = append([]string{sampleWord}, words...)
+		}
+		pickedNew[ch] = true
+		newCandidates = append(newCandidates, planTarget{
+			Character:         ch,
+			Pinyin:            py,
+			RecommendedWords:  words,
+			TargetRepetitions: 3,
+			Reason:            "按 10 分钟阅读科学比例（8%~10% 生字率）新引入的拓展生字，建议跨章节复现 ≥3 次",
+		})
+	}
+
+	// 第一轮：优先从 320 字分级词库中挑选既未读过、非基础脚手架字、也未排入待读故事的新字
+	for _, st := range gradedStarterPool {
+		if len(newCandidates) >= newQuota {
+			break
+		}
+		if !seenChars[st.Ch] && !scaffoldChars[st.Ch] && !unreadStoryChars[st.Ch] && !pickedNew[st.Ch] {
+			appendCandidate(st.Ch, st.Py, st.Word)
+		}
+	}
+	// 第二轮兜底：若 320 字均已读过或已在待读故事中，则仅排除已读字与基础脚手架字
+	if len(newCandidates) < newQuota {
+		for _, st := range gradedStarterPool {
+			if len(newCandidates) >= newQuota {
+				break
 			}
-			newCandidates = append(newCandidates, planTarget{
-				Character:         st.Ch,
-				Pinyin:            st.Py,
-				RecommendedWords:  words,
-				TargetRepetitions: 3,
-				Reason:            "按 10 分钟阅读科学比例（8%~10% 生字率）新引入的拓展生字，建议跨章节复现 ≥3 次",
-			})
+			if !seenChars[st.Ch] && !scaffoldChars[st.Ch] && !pickedNew[st.Ch] {
+				appendCandidate(st.Ch, st.Py, st.Word)
+			}
 		}
 	}
 
@@ -1283,18 +1575,31 @@ func (s *Server) handleAdminAutoGenerateStory(w http.ResponseWriter, r *http.Req
 
 	var reviewWords, observeWords, newWords []string
 	var reviewChars []string
+	var reviewTargetsVal, observeTargetsVal, newCandidatesVal []content.PlanValidationTarget
 	var prompt string
 	if plan, err := s.buildChildStoryPlan(r.Context(), req.ChildID); err == nil && plan != nil {
 		prompt = plan.StoryGenerationPrompt
 		for _, t := range plan.ReviewTargets {
 			reviewChars = append(reviewChars, t.Character)
 			reviewWords = append(reviewWords, t.RecommendedWords...)
+			reviewTargetsVal = append(reviewTargetsVal, content.PlanValidationTarget{
+				Character:         t.Character,
+				TargetRepetitions: t.TargetRepetitions,
+			})
 		}
 		for _, t := range plan.ObserveTargets {
 			observeWords = append(observeWords, t.RecommendedWords...)
+			observeTargetsVal = append(observeTargetsVal, content.PlanValidationTarget{
+				Character:         t.Character,
+				TargetRepetitions: t.TargetRepetitions,
+			})
 		}
 		for _, t := range plan.NewCandidates {
 			newWords = append(newWords, t.RecommendedWords...)
+			newCandidatesVal = append(newCandidatesVal, content.PlanValidationTarget{
+				Character:         t.Character,
+				TargetRepetitions: t.TargetRepetitions,
+			})
 		}
 	}
 	if len(newWords) == 0 {
@@ -1314,14 +1619,17 @@ func (s *Server) handleAdminAutoGenerateStory(w http.ResponseWriter, r *http.Req
 		model = s.cfg.LLM.Model
 	}
 	draft, err := content.GenerateAdaptiveStoryDraft(r.Context(), content.AutoStorySpec{
-		Theme:        req.Theme,
-		ReviewWords:  reviewWords,
-		ObserveWords: observeWords,
-		NewWords:     newWords,
-		Prompt:       prompt,
-		LLMAPIURL:    apiURL,
-		LLMAPIKey:    apiKey,
-		LLMModel:     model,
+		Theme:          req.Theme,
+		ReviewWords:    reviewWords,
+		ObserveWords:   observeWords,
+		NewWords:       newWords,
+		ReviewTargets:  reviewTargetsVal,
+		ObserveTargets: observeTargetsVal,
+		NewCandidates:  newCandidatesVal,
+		Prompt:         prompt,
+		LLMAPIURL:      apiURL,
+		LLMAPIKey:      apiKey,
+		LLMModel:       model,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1338,10 +1646,18 @@ func (s *Server) handleAdminAutoGenerateStory(w http.ResponseWriter, r *http.Req
 		"generator":     draft.Generator,
 		"review_words":  reviewWords,
 		"review_chars":  reviewChars,
+		"validation":    draft.Validation,
 		"published":     false,
 	}
 
-	if req.AutoPublish {
+	canAutoPublish := req.AutoPublish
+	if canAutoPublish && (draft.Generator == "smart_template" || draft.Validation == nil || !draft.Validation.Passed) {
+		canAutoPublish = false
+		resp["auto_publish_blocked"] = true
+		resp["auto_publish_reason"] = "草稿未通过完整度与目标字覆盖校验（或已降级为短模板），已保留为草稿，请审阅或重试后再发布"
+	}
+
+	if canAutoPublish {
 		storyID := newID("story")
 		versionID := fmt.Sprintf("%s_v1", storyID)
 		imageURLs, _ := content.RenderStoryIllustrations(
@@ -1747,47 +2063,59 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+func (s *Server) pushChildPromptToGist(ctx context.Context, childID, triggerType string) (*childStoryPlanResult, gistSyncStatus, error) {
+	// 串行化并发同步请求，避免旧请求后发先至覆盖新提示词快照
+	s.gistSyncMu.Lock()
+	defer s.gistSyncMu.Unlock()
 
-	var childID, childName string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT rs.child_id, COALESCE(c.name, '')
-		FROM reading_sessions rs
-		LEFT JOIN children c ON c.id = rs.child_id
-		WHERE rs.id = ?
-	`, sessionID).Scan(&childID, &childName)
-	if err != nil || childID == "" {
-		return
+	recordStatus := func(st gistSyncStatus) {
+		s.lastGistSyncStatus = st
 	}
 
 	plan, err := s.buildChildStoryPlan(ctx, childID)
 	if err != nil || plan == nil || strings.TrimSpace(plan.StoryGenerationPrompt) == "" {
-		return
+		if err == nil {
+			err = errors.New("empty story generation prompt")
+		}
+		log.Printf("[gist-sync] skip: buildChildStoryPlan failed for child %s: %v", childID, err)
+		st := gistSyncStatus{Trigger: triggerType, Success: false, Error: "build story plan failed"}
+		recordStatus(st)
+		return nil, st, err
 	}
 
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Now().In(loc)
-	version := now.Format("20060102150405")
 	updatedAt := now.Format("2006-01-02 15:04:05")
-
-	triggerType := "completed"
-	if endReason == "user_exit" && sessionStatus != "completed" {
-		triggerType = "partial_exit (中途保存退出)"
-	}
-
-	metaHeader := fmt.Sprintf(
-		"<!-- READING_SYNC_META\nversion: %s\nupdated_at: %s\nchild_id: %s\nchild_name: %s\nsession_id: %s\ntrigger: %s\n-->\n\n",
-		version, updatedAt, childID, childName, sessionID, triggerType,
-	)
-	fullContent := metaHeader + plan.StoryGenerationPrompt
 
 	const gistID = "aa8591c33578eb903d881cd133ec8fc3"
 	githubToken := strings.TrimSpace(os.Getenv("GITHUB_GIST_TOKEN"))
 	if githubToken == "" {
-		return
+		st := gistSyncStatus{
+			SyncedAt: updatedAt,
+			Trigger:  triggerType,
+			Success:  false,
+			Error:    "GITHUB_GIST_TOKEN 未配置，仅生成本地最新提示词",
+		}
+		recordStatus(st)
+		return plan, st, nil
 	}
+
+	var versionNum int64
+	_, _ = fmt.Sscanf(now.Format("20060102150405"), "%d", &versionNum)
+	if versionNum <= s.lastGistSyncVersion {
+		versionNum = s.lastGistSyncVersion + 1
+	}
+	versionStr := fmt.Sprintf("%d", versionNum)
+
+	// 仅写入脱敏后的短哈希标识，不向 Gist 暴露孩子真实姓名或原始 session_id
+	childHash := sha256.Sum256([]byte(childID))
+	childRef := hex.EncodeToString(childHash[:4])
+
+	metaHeader := fmt.Sprintf(
+		"<!-- READING_SYNC_META\nversion: %s\nupdated_at: %s\nchild_ref: %s\ntrigger: %s\n-->\n\n",
+		versionStr, updatedAt, childRef, triggerType,
+	)
+	fullContent := metaHeader + plan.StoryGenerationPrompt
 
 	reqBody := map[string]any{
 		"description": fmt.Sprintf("自适应阅读 10 分钟科学配比 AI 提示词 (最新更新: %s [%s])", updatedAt, triggerType),
@@ -1799,24 +2127,170 @@ func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason str
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return
+		log.Printf("[gist-sync] marshal body failed: %v", err)
+		st := gistSyncStatus{Version: versionNum, SyncedAt: updatedAt, Trigger: triggerType, Success: false, Error: err.Error()}
+		recordStatus(st)
+		return plan, st, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "https://api.github.com/gists/"+gistID, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return
+	apiBase := strings.TrimRight(strings.TrimSpace(s.gistAPIBaseURL), "/")
+	if apiBase == "" {
+		apiBase = "https://api.github.com/gists/" + gistID
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+githubToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "reader-gist-sync/1.0")
+
+	backoff := s.gistSyncBackoff
+	if backoff <= 0 {
+		backoff = time.Second
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	const maxAttempts = 3
+	var lastErr string
+	var lastHTTP int
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPatch, apiBase, strings.NewReader(string(bodyBytes)))
+		if reqErr != nil {
+			lastErr = reqErr.Error()
+			break
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", "Bearer "+githubToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "reader-gist-sync/1.1")
+
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			lastErr = doErr.Error()
+			lastHTTP = 0
+			log.Printf("[gist-sync] attempt %d/%d network error: %v", attempt, maxAttempts, doErr)
+		} else {
+			lastHTTP = resp.StatusCode
+			snippetBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				s.lastGistSyncVersion = versionNum
+				st := gistSyncStatus{
+					Version:    versionNum,
+					SyncedAt:   updatedAt,
+					Success:    true,
+					HTTPStatus: resp.StatusCode,
+					Attempts:   attempt,
+					Trigger:    triggerType,
+				}
+				recordStatus(st)
+				return plan, st, nil
+			}
+			lastErr = fmt.Sprintf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(snippetBytes)))
+			log.Printf("[gist-sync] attempt %d/%d failed: %s", attempt, maxAttempts, lastErr)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				st := gistSyncStatus{
+					Version:    versionNum,
+					SyncedAt:   updatedAt,
+					Success:    false,
+					HTTPStatus: lastHTTP,
+					Attempts:   attempt,
+					Trigger:    triggerType,
+					Error:      lastErr,
+				}
+				recordStatus(st)
+				return plan, st, nil
+			}
+		}
+
+		if attempt < maxAttempts {
+			wait := backoff * time.Duration(1<<(attempt-1))
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err().Error()
+				st := gistSyncStatus{
+					Version:    versionNum,
+					SyncedAt:   updatedAt,
+					Success:    false,
+					HTTPStatus: lastHTTP,
+					Attempts:   attempt,
+					Trigger:    triggerType,
+					Error:      lastErr,
+				}
+				recordStatus(st)
+				return plan, st, nil
+			case <-time.After(wait):
+			}
+		}
+	}
+
+	st := gistSyncStatus{
+		Version:    versionNum,
+		SyncedAt:   updatedAt,
+		Success:    false,
+		HTTPStatus: lastHTTP,
+		Attempts:   maxAttempts,
+		Trigger:    triggerType,
+		Error:      lastErr,
+	}
+	recordStatus(st)
+	return plan, st, nil
+}
+
+func (s *Server) handleAdminGistPushPrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	var req struct {
+		ChildID string `json:"child_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	childID := strings.TrimSpace(req.ChildID)
+	if childID == "" {
+		writeError(w, http.StatusBadRequest, "child_id is required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	plan, syncStatus, err := s.pushChildPromptToGist(ctx, childID, "manual_push")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"child_id":                childID,
+		"plan":                    plan,
+		"story_generation_prompt": plan.StoryGenerationPrompt,
+		"gist_sync":               syncStatus,
+	})
+}
+
+func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var childID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT rs.child_id
+		FROM reading_sessions rs
+		WHERE rs.id = ?
+	`, sessionID).Scan(&childID)
+	if err != nil || childID == "" {
+		log.Printf("[gist-sync] skip: session %s child lookup failed: %v", sessionID, err)
+		s.gistSyncMu.Lock()
+		s.lastGistSyncStatus = gistSyncStatus{Success: false, Error: "session child lookup failed"}
+		s.gistSyncMu.Unlock()
+		return
+	}
+
+	triggerType := "completed"
+	if endReason == "user_exit" && sessionStatus != "completed" {
+		triggerType = "partial_exit"
+	}
+	_, _, _ = s.pushChildPromptToGist(ctx, childID, triggerType)
 }
 
 func (s *Server) StartDailyStorySyncWorker() {

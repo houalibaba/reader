@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   apiClient,
   ChildProfile,
+  GistSyncStatus,
   HealthStatusResponse,
   PlanTargetItem,
   SentenceToken,
@@ -242,6 +243,11 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
   const [vocabList, setVocabList] = useState<VocabularyEntry[]>([]);
   const [loadingPlan, setLoadingPlan] = useState<boolean>(false);
   const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
+  const [generatingPrompt, setGeneratingPrompt] = useState<boolean>(false);
+  const [promptDialogText, setPromptDialogText] = useState<string>('');
+  const [promptDialogSync, setPromptDialogSync] = useState<GistSyncStatus | null>(null);
+  const [copiedDialogPrompt, setCopiedDialogPrompt] = useState<boolean>(false);
+  const promptDialogRef = useRef<HTMLDialogElement | null>(null);
   const [showAllReviewChars, setShowAllReviewChars] = useState<boolean>(false);
 
   const [expandedStep, setExpandedStep] = useState<'step2' | 'step3' | null>(null);
@@ -523,6 +529,66 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
         }
       }
     });
+  };
+
+  const openPromptDialog = () => {
+    const dlg = promptDialogRef.current;
+    if (!dlg) return;
+    if (typeof dlg.showModal === 'function') {
+      if (!dlg.open) dlg.showModal();
+    } else {
+      dlg.setAttribute('open', '');
+    }
+  };
+
+  const closePromptDialog = () => {
+    const dlg = promptDialogRef.current;
+    if (!dlg) return;
+    if (typeof dlg.close === 'function' && dlg.open) {
+      dlg.close();
+    } else {
+      dlg.removeAttribute('open');
+    }
+  };
+
+  const handleGenerateAndPushPrompt = async () => {
+    if (!activeChild?.id) {
+      setErrorMsg('请先选择儿童档案');
+      return;
+    }
+    setGeneratingPrompt(true);
+    setErrorMsg('');
+    setStatusMsg('');
+    setCopiedDialogPrompt(false);
+    try {
+      const res = await apiClient.pushLatestPromptToGist(pin, activeChild.id);
+      if (res.plan) {
+        setPlan(res.plan);
+      }
+      setPromptDialogText(res.story_generation_prompt || res.plan?.story_generation_prompt || '');
+      setPromptDialogSync(res.gist_sync || null);
+      if (res.gist_sync?.success) {
+        setStatusMsg(`✅ 已生成最新提示词并上传 Gist（版本 ${res.gist_sync.version || ''}）`);
+      } else if (res.gist_sync?.error) {
+        setStatusMsg(`⚠️ 已生成最新提示词，但上传 Gist 未成功：${res.gist_sync.error}`);
+      }
+      openPromptDialog();
+    } catch (err: any) {
+      setErrorMsg(`生成最新提示词失败：${err.message || String(err)}`);
+    } finally {
+      setGeneratingPrompt(false);
+    }
+  };
+
+  const handleCopyDialogPrompt = async () => {
+    if (!promptDialogText) return;
+    try {
+      await navigator.clipboard.writeText(promptDialogText);
+      setCopiedDialogPrompt(true);
+      window.setTimeout(() => setCopiedDialogPrompt(false), 2500);
+    } catch {
+      setErrorMsg('浏览器限制自动复制，请在对话框内手动全选复制。');
+    }
   };
 
   const handleCopyPrompt = async () => {
@@ -1199,6 +1265,20 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
                   <button
                     type="button"
                     class="step-action-btn step-action-primary"
+                    disabled={generatingPrompt || !activeChild}
+                    onClick={() => void handleGenerateAndPushPrompt()}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                    </svg>
+                    <span>
+                      {generatingPrompt ? '⏳ 正在生成并上传 Gist...' : '✨ 生成最新提示词并上传 Gist'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    class="step-action-btn step-action-outline"
                     onClick={handleCopyPrompt}
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1801,6 +1881,67 @@ export function GuardianPage({ activeChild, onClose, onChildDeleted }: GuardianP
           >
             ← 返回儿童阅读书架
           </button>
+        </div>
+      </dialog>
+
+      <dialog
+        ref={promptDialogRef}
+        class="prompt-modal-dialog"
+        aria-labelledby="prompt-dialog-title"
+        onClick={(e) => {
+          if (e.target === promptDialogRef.current) {
+            closePromptDialog();
+          }
+        }}
+      >
+        <div class="prompt-dialog-inner">
+          <div class="prompt-dialog-header">
+            <h3 id="prompt-dialog-title">最新 AI 提示词</h3>
+            <button
+              type="button"
+              class="prompt-dialog-close"
+              aria-label="关闭对话框"
+              onClick={closePromptDialog}
+            >
+              ×
+            </button>
+          </div>
+
+          {promptDialogSync && (
+            <div
+              class={`prompt-sync-banner ${promptDialogSync.success ? 'is-success' : 'is-warn'}`}
+              role="status"
+            >
+              {promptDialogSync.success
+                ? `☁️ 已同步上传至 Gist（版本 ${promptDialogSync.version || '-'} · ${promptDialogSync.synced_at || ''}）`
+                : `⚠️ 已生成最新提示词，但上传 Gist 失败：${promptDialogSync.error || '请检查网络与 GITHUB_GIST_TOKEN'}`}
+            </div>
+          )}
+
+          <textarea
+            readOnly
+            class="compact-textarea prompt-mono-box prompt-dialog-textarea"
+            rows={14}
+            value={promptDialogText || '暂无提示词数据'}
+            onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+          />
+
+          <div class="prompt-dialog-footer">
+            <button
+              type="button"
+              class="step-action-btn step-action-primary"
+              onClick={() => void handleCopyDialogPrompt()}
+            >
+              {copiedDialogPrompt ? '已复制提示词 ✓' : '📋 一键复制提示词'}
+            </button>
+            <button
+              type="button"
+              class="step-action-btn step-action-outline"
+              onClick={closePromptDialog}
+            >
+              关闭
+            </button>
+          </div>
         </div>
       </dialog>
     </div>

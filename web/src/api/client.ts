@@ -122,6 +122,23 @@ export interface CustomImageUploadPayload {
   data_base64: string;
 }
 
+export interface GistSyncStatus {
+  version?: number;
+  synced_at?: string;
+  success: boolean;
+  http_status?: number;
+  attempts?: number;
+  trigger?: string;
+  error?: string;
+}
+
+export interface GistPromptPushResponse {
+  child_id: string;
+  plan: StoryPlanResponse;
+  story_generation_prompt: string;
+  gist_sync: GistSyncStatus;
+}
+
 export interface GistStoryPullResponse {
   status: 'imported' | 'already_imported';
   version: string;
@@ -314,6 +331,24 @@ export const apiClient = {
       body: JSON.stringify(payload)
     });
     const data = await res.json();
+    if (!res.ok) throw new Error(data.error || data.detail || `HTTP ${res.status}`);
+    return data;
+  },
+
+  async pushLatestPromptToGist(
+    pin: string,
+    childId: string
+  ): Promise<GistPromptPushResponse> {
+    const res = await fetch('/api/v1/admin/gist-push-prompt', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'X-Guardian-Pin': pin
+      },
+      body: JSON.stringify({ child_id: childId })
+    });
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || data.detail || `HTTP ${res.status}`);
     return data;
   },

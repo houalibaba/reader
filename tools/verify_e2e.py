@@ -203,7 +203,7 @@ class TestChineseAdaptiveReaderE2E(unittest.TestCase):
         self.assertEqual(len(plan["review_targets"]), 1)
         self.assertEqual(plan["review_targets"][0]["character"], "河")
 
-        # 6c. Verify Full-Automatic Story Generation & Immediate Publishing (`POST /api/v1/admin/auto-generate-story`)
+        # 6c. Verify Full-Automatic Story Generation blocks auto_publish on short template fallback
         r_auto = client.post(
             "/api/v1/admin/auto-generate-story",
             headers={"X-Guardian-Pin": "1234"},
@@ -211,10 +211,9 @@ class TestChineseAdaptiveReaderE2E(unittest.TestCase):
         )
         self.assertEqual(r_auto.status_code, 200)
         auto_data = r_auto.json()
-        self.assertTrue(auto_data["published"])
-        self.assertGreaterEqual(auto_data["sentence_count"], 5)
-        check_auto = verify_draft_against_plan(auto_data["sentences"], plan)
-        self.assertTrue(check_auto["passed"], f"Auto-generated draft failed plan validation: {check_auto}")
+        self.assertFalse(auto_data["published"])
+        self.assertTrue(auto_data.get("auto_publish_blocked"))
+        self.assertFalse(auto_data["validation"]["passed"])
 
         # 6d. Verify Zero-CLI Online Quick Story Updating (`POST /api/v1/admin/quick-story`)
         r_quick_update = client.post(
@@ -275,9 +274,20 @@ class TestChineseAdaptiveReaderE2E(unittest.TestCase):
 
 
         # 6g. Verify 100% real Pinyin annotation (never falling back to character itself) & dummy audio stripping
-        auto_story_id = auto_data["imported_story_id"]
+        r_quick_new = client.post(
+            "/api/v1/admin/quick-story",
+            headers={"X-Guardian-Pin": "1234"},
+            json={
+                "title": "森林新探险",
+                "theme": "勇气与探索",
+                "raw_text": "小熊来到清澈的小河边。他稳稳地走过木桥欣赏白雪。",
+            },
+        )
+        self.assertEqual(r_quick_new.status_code, 200)
+        quick_story_id = r_quick_new.json()["imported_story_id"]
+        quick_ver_id = r_quick_new.json()["imported_version_id"]
         auto_ver_detail = client.get(
-            f"/api/v1/stories/{auto_story_id}/versions/{auto_data['imported_version_id']}"
+            f"/api/v1/stories/{quick_story_id}/versions/{quick_ver_id}"
         ).json()
         punct = set("，。！？、：；“”‘’（）")
         for sent in auto_ver_detail["sentences"]:
@@ -291,7 +301,7 @@ class TestChineseAdaptiveReaderE2E(unittest.TestCase):
                     )
 
         # 6f. Verify Story Deletion removes story from bookshelf while preserving child vocabulary history
-        auto_story_id = auto_data["imported_story_id"]
+        auto_story_id = quick_story_id
         r_del_story = client.delete(f"/api/v1/admin/stories/{auto_story_id}", headers={"X-Guardian-Pin": "1234"})
         self.assertEqual(r_del_story.status_code, 200)
         stories_after_del = [s["id"] for s in client.get("/api/v1/stories").json()["stories"]]
