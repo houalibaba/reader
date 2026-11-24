@@ -2,7 +2,7 @@ APP_NAME := reader
 SERVER_DIR := server
 WEB_DIR := web
 DIST_DIR := dist
-VERSION ?= v0.3.18
+VERSION ?= v0.3.19
 
 # Target baseline x86-64 (GOAMD64=v1, no AVX/AVX2/BMI1/BMI2/FMA/LZCNT) so binaries compiled on
 # AMD Ryzen / modern Xeon hosts run without SIGILL (invalid opcode) on Intel Atom x5-Z8350 (Cherry Trail).

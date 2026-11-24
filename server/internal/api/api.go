@@ -975,10 +975,10 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 		JOIN sentence_tokens st ON st.sentence_id = ss.id
 		WHERE s.status = 'published'
 		  AND NOT EXISTS (
-			  SELECT 1 FROM reading_sessions rs
-			  WHERE rs.child_id = ?
-			    AND rs.story_version_id = sv.id
-			    AND rs.status = 'completed'
+			SELECT 1 FROM reading_sessions rs
+			WHERE rs.child_id = ?
+			  AND rs.story_version_id = sv.id
+			  AND rs.status = 'completed'
 		  )
 	`, childID)
 	if unreadErr == nil {
@@ -1108,14 +1108,14 @@ func (s *Server) buildChildStoryPlan(ctx context.Context, childID string) (*chil
 			"reading_sessions":            readingSessions,
 		},
 		ReadingScience: map[string]any{
-			"reading_duration_minutes":      10,
-			"target_total_chars_min":        360,
-			"target_total_chars_max":        450,
-			"target_sentences_min":          16,
-			"target_sentences_max":          20,
-			"target_chars_per_sentence":     "18~24",
-			"mastered_ratio_pct":            "90%~92%",
-			"unfamiliar_ratio_pct":          "8%~10%",
+			"reading_duration_minutes":     10,
+			"target_total_chars_min":       360,
+			"target_total_chars_max":       450,
+			"target_sentences_min":         16,
+			"target_sentences_max":         20,
+			"target_chars_per_sentence":    "18~24",
+			"mastered_ratio_pct":           "90%~92%",
+			"unfamiliar_ratio_pct":         "8%~10%",
 			"target_unfamiliar_char_budget": totalBudget,
 		},
 		AvailableThemes:       content.BuiltinThemes,
@@ -1415,8 +1415,8 @@ func (s *Server) handleAdminDeleteStory(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"deleted":                 storyID,
-		"title":                   title,
+		"deleted":               storyID,
+		"title":                 title,
 		"preserved_vocab_history": !hardDelete,
 	})
 }
@@ -1738,8 +1738,8 @@ func (s *Server) handleStories(w http.ResponseWriter, r *http.Request) {
 		JOIN story_versions sv ON sv.story_id = s.id
 		WHERE s.status = 'published' AND sv.status = 'published'
 		  AND sv.version_number = (
-			SELECT MAX(sv2.version_number) FROM story_versions sv2
-			WHERE sv2.story_id = s.id AND sv2.status = 'published'
+		      SELECT MAX(sv2.version_number) FROM story_versions sv2
+		      WHERE sv2.story_id = s.id AND sv2.status = 'published'
 		  )
 		ORDER BY s.created_at DESC
 	`)
@@ -2268,21 +2268,34 @@ func (s *Server) handleAdminGistPushPrompt(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+const minEffectivePagesForGistSync = 7
+
 func (s *Server) syncSessionPromptToGist(sessionID, sessionStatus, endReason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	var childID string
+	var childID, mode string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT rs.child_id
+		SELECT rs.child_id, COALESCE(rs.mode, '')
 		FROM reading_sessions rs
 		WHERE rs.id = ?
-	`, sessionID).Scan(&childID)
+	`, sessionID).Scan(&childID, &mode)
 	if err != nil || childID == "" {
 		log.Printf("[gist-sync] skip: session %s child lookup failed: %v", sessionID, err)
 		s.gistSyncMu.Lock()
 		s.lastGistSyncStatus = gistSyncStatus{Success: false, Error: "session child lookup failed"}
 		s.gistSyncMu.Unlock()
+		return
+	}
+
+	if strings.EqualFold(strings.TrimSpace(mode), "accompanied") {
+		log.Printf("[gist-sync] skip: session %s is accompanied mode", sessionID)
+		return
+	}
+
+	_, _, effectivePages := s.computeSessionReadingStats(ctx, sessionID)
+	if effectivePages < minEffectivePagesForGistSync {
+		log.Printf("[gist-sync] skip: session %s effective pages %d < %d", sessionID, effectivePages, minEffectivePagesForGistSync)
 		return
 	}
 
@@ -3427,6 +3440,11 @@ func computeEffectivePageReadingMs(dwellMs, sentenceAudioMs int64, charCount, ca
 }
 
 func (s *Server) computeSessionReadingMs(ctx context.Context, sessionID string) (int64, int) {
+	totalEffectiveMs, viewCount, _ := s.computeSessionReadingStats(ctx, sessionID)
+	return totalEffectiveMs, viewCount
+}
+
+func (s *Server) computeSessionReadingStats(ctx context.Context, sessionID string) (int64, int, int) {
 	cappedClicksByView := make(map[string]int)
 	ceRows, ceErr := s.db.QueryContext(ctx, `
 		SELECT ce.sentence_view_id, ce.token_id, COUNT(*)
@@ -3452,34 +3470,42 @@ func (s *Server) computeSessionReadingMs(ctx context.Context, sessionID string) 
 
 	svRows, svErr := s.db.QueryContext(ctx, `
 		SELECT svw.id,
-		       svw.dwell_time_ms,
-		       COALESCE(ss.text, ''),
-		       COALESCE((
-		           SELECT SUM(CASE WHEN ae.play_duration_ms > 0 THEN ae.play_duration_ms ELSE 0 END)
-		           FROM audio_events ae
-		           WHERE ae.sentence_view_id = svw.id AND ae.audio_type = 'sentence'
-		       ), 0) AS sentence_audio_ms
+			svw.sentence_id,
+			svw.is_valid,
+			svw.dwell_time_ms,
+			COALESCE(ss.text, ''),
+			COALESCE((
+				SELECT SUM(CASE WHEN ae.play_duration_ms > 0 THEN ae.play_duration_ms ELSE 0 END)
+				FROM audio_events ae
+				WHERE ae.sentence_view_id = svw.id AND ae.audio_type = 'sentence'
+			), 0) AS sentence_audio_ms
 		FROM sentence_views svw
 		LEFT JOIN story_sentences ss ON ss.id = svw.sentence_id
 		WHERE svw.session_id = ?
 	`, sessionID)
 	if svErr != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	defer func() { _ = svRows.Close() }()
 
 	var totalEffectiveMs int64
 	viewCount := 0
+	effectiveSentences := make(map[string]struct{})
 	for svRows.Next() {
-		var svID, text string
+		var svID, sentenceID, text string
+		var isValid int
 		var dwellMs, sentenceAudioMs int64
-		if err := svRows.Scan(&svID, &dwellMs, &text, &sentenceAudioMs); err != nil {
+		if err := svRows.Scan(&svID, &sentenceID, &isValid, &dwellMs, &text, &sentenceAudioMs); err != nil {
 			continue
 		}
 		viewCount++
 		charCount := countReadableChars(text)
 		cappedClicks := cappedClicksByView[svID]
-		totalEffectiveMs += computeEffectivePageReadingMs(dwellMs, sentenceAudioMs, charCount, cappedClicks)
+		pageMs := computeEffectivePageReadingMs(dwellMs, sentenceAudioMs, charCount, cappedClicks)
+		totalEffectiveMs += pageMs
+		if isValid == 1 && pageMs > 0 && sentenceID != "" {
+			effectiveSentences[sentenceID] = struct{}{}
+		}
 	}
-	return totalEffectiveMs, viewCount
+	return totalEffectiveMs, viewCount, len(effectiveSentences)
 }

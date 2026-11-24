@@ -592,6 +592,13 @@ func TestGistPromptSyncRetriesRecordsStatusAndRedactsChildName(t *testing.T) {
 	seedTestStory(t, srv, "story_gist_sync")
 	_, _ = srv.db.Exec(`INSERT INTO story_versions (id, story_id, version_number, text_content, checksum, status) VALUES ('ver_gs', 'story_gist_sync', 1, '测试', 'chk_gs', 'published')`)
 	_, _ = srv.db.Exec(`INSERT INTO reading_sessions (id, child_id, story_version_id, mode, status, pinyin_hint_enabled) VALUES ('sess_gs', 'child_default_liuliu', 'ver_gs', 'solo', 'completed', 0)`)
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	for i := 0; i < 7; i++ {
+		sid := "sent_gs_" + string(rune('a'+i))
+		svID := "sv_gs_" + string(rune('a'+i))
+		_, _ = srv.db.Exec(`INSERT INTO story_sentences (id, version_id, sequence_index, text) VALUES (?, 'ver_gs', ?, '测试句子')`, sid, i)
+		_, _ = srv.db.Exec(`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid) VALUES (?, 'sess_gs', ?, ?, 5000, 1)`, svID, sid, nowStr)
+	}
 
 	attempts := 0
 	var lastPayload string
@@ -633,6 +640,98 @@ func TestGistPromptSyncRetriesRecordsStatusAndRedactsChildName(t *testing.T) {
 	srv.syncSessionPromptToGist("sess_gs", "completed", "finished")
 	if srv.lastGistSyncVersion <= firstVer {
 		t.Fatalf("expected strictly monotonic version on consecutive syncs: %d -> %d", firstVer, srv.lastGistSyncVersion)
+	}
+}
+
+func TestGistPromptSyncSkipsAccompaniedAndShortEffectiveSessions(t *testing.T) {
+	srv := newTestServer(t, "1234")
+	srv.gistSyncBackoff = time.Millisecond
+
+	seedTestStory(t, srv, "story_gist_filter")
+	_, err := srv.db.Exec(`INSERT INTO story_versions (id, story_id, version_number, text_content, checksum, status) VALUES ('ver_gf', 'story_gist_filter', 1, '测试', 'chk_gf', 'published')`)
+	if err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+	// 种 9 句，每句 4 个有效汉字 -> 基准时长 4000ms，有效阅读净停留门槛为 2000ms
+	for i := 0; i < 9; i++ {
+		sid := "sent_gf_" + string(rune('a'+i))
+		if _, err := srv.db.Exec(`INSERT INTO story_sentences (id, version_id, sequence_index, text) VALUES (?, 'ver_gf', ?, '测试句子')`, sid, i); err != nil {
+			t.Fatalf("seed sentence %s: %v", sid, err)
+		}
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	seedSession := func(sessID, mode string, validDistinctPages int) {
+		t.Helper()
+		if _, err := srv.db.Exec(
+			`INSERT INTO reading_sessions (id, child_id, story_version_id, mode, status, pinyin_hint_enabled) VALUES (?, 'child_default_liuliu', 'ver_gf', ?, 'completed', 0)`,
+			sessID, mode,
+		); err != nil {
+			t.Fatalf("seed session %s: %v", sessID, err)
+		}
+		for i := 0; i < validDistinctPages; i++ {
+			svID := "sv_" + sessID + "_" + string(rune('a'+i))
+			sentID := "sent_gf_" + string(rune('a'+i))
+			if _, err := srv.db.Exec(
+				`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid, invalid_reason) VALUES (?, ?, ?, ?, 5000, 1, '')`,
+				svID, sessID, sentID, nowStr,
+			); err != nil {
+				t.Fatalf("seed view %s: %v", svID, err)
+			}
+		}
+	}
+
+	// 1. 家长陪读：即便有 7 页有效阅读，也必须跳过
+	seedSession("sess_gf_acc", "accompanied", 7)
+
+	// 2. 自主阅读：仅 6 页有效阅读，再额外塞入 4 种“不能算数”的浏览记录，仍必须跳过
+	seedSession("sess_gf_short", "solo", 6)
+	// 2a. 重复翻看第 1 页（不能靠刷同一页凑满 7 页）
+	_, _ = srv.db.Exec(`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid, invalid_reason) VALUES ('sv_short_dup', 'sess_gf_short', 'sent_gf_a', ?, 5000, 1, '')`, nowStr)
+	// 2b. 第 7 页停留仅 1500ms（虽 >=300ms 故 is_valid=1，但低于基准一半 2000ms -> 有效阅读时长为 0）
+	_, _ = srv.db.Exec(`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid, invalid_reason) VALUES ('sv_short_too_fast', 'sess_gf_short', 'sent_gf_g', ?, 1500, 1, '')`, nowStr)
+	// 2c. 第 8 页停留 5000ms，但整句朗读播了 4000ms（净停留 1000ms < 2000ms -> 有效阅读时长为 0）
+	_, _ = srv.db.Exec(`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid, invalid_reason) VALUES ('sv_short_audio_only', 'sess_gf_short', 'sent_gf_h', ?, 5000, 1, '')`, nowStr)
+	_, _ = srv.db.Exec(`INSERT INTO audio_events (id, sentence_view_id, audio_type, played_at, play_duration_ms, completed) VALUES ('ae_short_h', 'sv_short_audio_only', 'sentence', ?, 4000, 1)`, nowStr)
+	// 2d. 第 9 页挂机超时（is_valid=0 -> 无效）
+	_, _ = srv.db.Exec(`INSERT INTO sentence_views (id, session_id, sentence_id, entered_at, dwell_time_ms, is_valid, invalid_reason) VALUES ('sv_short_idle', 'sess_gf_short', 'sent_gf_i', ?, 200000, 0, 'abnormal_long_dwell')`, nowStr)
+
+	// 3. 自主阅读：满 7 页去重有效阅读，必须正常推送
+	seedSession("sess_gf_ok", "solo", 7)
+
+	attempts := 0
+	mockGist := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"aa8591c33578eb903d881cd133ec8fc3"}`))
+	}))
+	defer mockGist.Close()
+
+	srv.gistAPIBaseURL = mockGist.URL
+	t.Setenv("GITHUB_GIST_TOKEN", "test_token_filter")
+
+	srv.syncSessionPromptToGist("sess_gf_acc", "completed", "finished")
+	if attempts != 0 {
+		t.Fatalf("expected accompanied session to skip gist sync, got %d requests", attempts)
+	}
+	if srv.lastGistSyncStatus.Error != "" {
+		t.Fatalf("expected accompanied skip not to pollute lastGistSyncStatus.Error, got %+v", srv.lastGistSyncStatus)
+	}
+
+	srv.syncSessionPromptToGist("sess_gf_short", "active", "user_exit")
+	if attempts != 0 {
+		t.Fatalf("expected session with only 6 effective pages to skip gist sync, got %d requests", attempts)
+	}
+	if srv.lastGistSyncStatus.Error != "" {
+		t.Fatalf("expected short-session skip not to pollute lastGistSyncStatus.Error, got %+v", srv.lastGistSyncStatus)
+	}
+
+	srv.syncSessionPromptToGist("sess_gf_ok", "active", "user_exit")
+	if attempts != 1 {
+		t.Fatalf("expected solo session with 7 effective pages to sync once, got %d requests", attempts)
+	}
+	if !srv.lastGistSyncStatus.Success {
+		t.Fatalf("expected successful gist sync status for 7 effective pages, got %+v", srv.lastGistSyncStatus)
 	}
 }
 
